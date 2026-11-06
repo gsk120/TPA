@@ -9,7 +9,7 @@ const snap=make('11111111-1111-4111-8111-111111111111','돌잔치 스냅 예약'
 const root='돌잔치 스냅 예약이랑 돌잔치 장소 예약 일정 내일로 변경해줘';
 const payload=(text,actor='1',extra={})=>({text,actor,chatId:'-10',...extra});
 const clarification={operation:'update',candidateIds:[snap.id,place.id],proposedChanges:[{field:'dueDate',value:'2026-11-03'}],question:'두 항목 모두 변경할까요?',unresolved:'대상 범위'};
-function harness(){let state=null;let tasks=structuredClone([snap,place]);const saved=[];return {saved,get state(){return state;},store:{tasks:async()=>tasks,conversation:async actor=>state?.actor===actor?state:null,relatedHistory:async()=>({events:[],total:0,truncated:false}),finish:async(job,changes,reply,_settings,memory)=>{for(const c of changes)tasks=tasks.map(t=>t.id===c.after.id?c.after:t);if(memory.conversation)state=memory.conversation;saved.push({changes,reply,state:structuredClone(state)});}}};}
+function harness(){let state=null;let tasks=structuredClone([snap,place]);const saved=[];return {saved,get state(){return state;},store:{tasks:async()=>tasks,conversation:async actor=>state?.actor===actor?state:null,relatedHistory:async()=>({events:[],total:0,truncated:false}),finish:async(job,changes,reply,_settings,memory)=>{for(const c of changes)tasks=tasks.map(t=>t.id===c.after.id?c.after:t);if(memory.conversation)state=memory.conversation;saved.push({changes,reply,button:memory.button,state:structuredClone(state)});}}};}
 const update=t=>({operation:'update',id:t.id,expectedVersion:t.version,task:{...t,dueDate:'2026-11-03'},reason:'요청한 연기'});
 test('explicit two-title request reaches AI with both complete candidates and commits both atomically',async()=>{
  const h=harness();let calls=0;const ai={answer:async input=>{calls++;assert.deepEqual(input.tasks.map(t=>t.id).sort(),[snap.id,place.id].sort());return {reply:'',actions:input.tasks.map(update),clarification:null};}};
@@ -35,6 +35,79 @@ test('other actor, expiration and already resolved question do not reuse old mod
 test('new independent target does not inherit pending wedding changes',()=>{
  const state=nextConversation('1',root,'두 항목 모두 변경할까요?',[snap.id,place.id],null,now,{clarification});const dental=make('33333333-3333-4333-8333-333333333333','기석 치과');
  const s=selectContext([snap,place,dental],payload('기석 치과만 내일로 변경해줘'),state,null,now);assert.equal(s.continuation,false);assert.deepEqual(s.candidates.map(t=>t.id),[dental.id]);assert.equal(s.request,null);
+});
+
+test('separate completion clauses are not partially saved when candidate search misses a title',async()=>{
+ const h=harness();
+ const instrumented={...h.store,tasks:async()=>[
+  {...snap,title:'기석 우쿠렐레'},
+  {...place,title:'나래랑 루이의 순위를 서로 바꿀지 고민한다'}
+ ]};
+ await processJob({payload:payload('우쿠렐레 완료했고 나래랑 루이의 순서 바꾸는것도 했어')},
+  instrumented,{answer:async input=>{
+   assert.deepEqual(input.tasks.map(t=>t.id),[place.id]);
+   return {actions:[update(input.tasks[0])]};
+  }},now);
+ assert.equal(h.saved[0].changes.length,0);
+ assert.match(h.saved[0].reply,/일부를 확인하지 못했어요/);
+});
+
+
+test('completion searches only active tasks while completed items remain queryable',async()=>{
+ const h=harness();
+ const title='개인비서 테스트';
+ const completed={...snap,title,status:'done',dueDate:'2026-11-05'};
+ const active={...place,title,dueDate:'2026-11-06'};
+ const cancelled={...place,id:'cancelled',title,status:'cancelled'};
+ const store={...h.store,tasks:async()=>[completed,active,cancelled]};
+ await processJob({payload:payload(title+' 완료')},store,{answer:async()=>assert.fail('exact completion must skip Codex')},now);
+ assert.deepEqual(h.saved[0].changes.map(c=>c.after.id),[active.id]);
+ assert.equal(h.saved[0].changes[0].after.status,'done');
+ assert.equal(h.saved[0].changes[0].after.dueDate,active.dueDate);
+ assert.equal(h.saved[0].button.action.kind,'undo');
+ await processJob({payload:payload(title+' 완료한 일정 보여줘')},store,{answer:async input=>{
+  assert.ok(input.tasks.some(t=>t.id===completed.id));
+  return {actions:[],retrieval:{kind:'task_list',status:'done',from:null,to:null,person:null,search:title}};
+ }},now);
+ assert.match(h.saved[1].reply,/2026년 11월 5일/);
+});
+
+
+test('same-title candidates produce capped controls before calling Codex',async()=>{
+ for(const count of [2,3,4,13]){
+  const h=harness();
+  const tasks=Array.from({length:count},(_,i)=>({...snap,id:'task-'+i,title:'개인비서 테스트',
+   dueDate:'2026-11-'+String(i+5).padStart(2,'0')}));
+  const store={...h.store,tasks:async()=>tasks};
+  await processJob({payload:payload('개인비서 테스트 완료')},store,{answer:async()=>assert.fail('unexpected Codex call')},now);
+  assert.equal(h.saved[0].button?.markup.inline_keyboard.length,count<=3?count:undefined);
+  if(count>3) assert.match(h.saved[0].reply,new RegExp(count+'건'));
+  await processJob({payload:payload('11월 6일 거')},store,{answer:async input=>{
+   assert.equal(input.pendingRequest.originalText,'개인비서 테스트 완료');
+   assert.equal(input.selectedTaskId,'task-1');
+   assert.deepEqual(input.tasks.map(t=>t.id),['task-1']);
+   return {actions:[{...update(tasks[1]),task:{...tasks[1],status:'done'}}]};
+  }},new Date(+now+60000));
+  assert.deepEqual(h.saved[1].changes.map(c=>c.after.id),['task-1']);
+  assert.equal(h.saved[1].button.action.kind,'undo');
+ }
+});
+test('explicit date and all scope bypass selection; partial all updates are rejected',async()=>{
+ const h=harness();
+ const tasks=[{...snap,title:'개인비서 테스트',dueDate:'2026-11-05'},{...place,title:'개인비서 테스트',dueDate:'2026-11-06'}];
+ const store={...h.store,tasks:async()=>tasks};
+ const done=t=>({...update(t),task:{...t,status:'done'}});
+ await processJob({payload:payload('11월 6일 개인비서 테스트 완료')},store,{answer:async input=>{
+  assert.deepEqual(input.tasks.map(t=>t.id),[place.id]);return {actions:input.tasks.map(done)};
+ }},now);
+ await processJob({payload:payload('개인비서 테스트 전부 완료')},store,{answer:async input=>({actions:[done(input.tasks[0])]})},now);
+ assert.equal(h.saved[1].changes.length,0);
+ await processJob({payload:payload('개인비서 테스트 전부 완료')},store,{answer:async input=>({actions:input.tasks.map(done)})},now);
+ assert.equal(h.saved[2].changes.length,2);
+ assert.equal(h.saved[2].button.action.kind,'undo');
+ const remaining={...store,tasks:async()=>[{...tasks[0],status:'done'},tasks[1]]};
+ await processJob({payload:payload('11월 5일 개인비서 테스트 완료')},remaining,{answer:async()=>assert.fail('wrong date must not reach Codex')},now);
+ assert.equal(h.saved[3].changes.length,0);
 });
 test('invalid proposal date and IDs fail before storage',()=>{
  assert.throws(()=>validateClarification({...clarification,candidateIds:['other']},[snap.id,place.id]));assert.throws(()=>validateClarification({...clarification,proposedChanges:[{field:'dueDate',value:'2026-02-30'}]},[snap.id,place.id]));

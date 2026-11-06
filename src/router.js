@@ -8,6 +8,46 @@ export async function routeUpdate(u,families,tg,bot){
    else if(!event.new_chat_member.user.is_bot)await families.member(f,event.new_chat_member.user.id,memberActive(event.new_chat_member),u.update_id);
    return;
  }
+ const callback = u.callback_query;
+ if (callback) {
+   let notice = 'unavailable';
+   const m = callback.message;
+   const match = /^tpa:([\da-f-]{36}):(\d{1,2})$/.exec(callback.data || '');
+   const f = match && m && ['group', 'supergroup'].includes(m.chat?.type)
+     && m.from?.id === bot.id && !callback.from.is_bot ? await families.family(m.chat.id) : null;
+   if (f?.active) {
+     const store = families.store(f);
+     const action = await store.runtimeValue('button:' + match[1]);
+     if (!action || Date.parse(action.expiresAt) <= Date.now()) {
+       notice = 'expired';
+     } else if (action.actor !== String(callback.from.id) || action.chatId !== String(m.chat.id)) {
+       notice = 'owner';
+     } else {
+       const undo = action.kind === 'undo';
+       const index = Number(match[2]);
+       if (undo ? index === 0 : action.kind === 'select' && action.targets[index]) {
+         // The worker checks live Telegram membership before applying any change.
+         const queued = await store.ingest(u.update_id, {
+           actor: String(callback.from.id), chatId: String(m.chat.id),
+           text: undo ? '방금 변경 되돌리기' : '일정 대상 선택',
+           button: { token: match[1], index, messageId: m.message_id }
+         });
+         notice = queued ? null : 'duplicate';
+       }
+     }
+     if (notice) {
+       const messages = {
+         unavailable: '사용할 수 없는 버튼이에요.',
+         expired: '이미 처리됐거나 만료된 버튼이에요.',
+         owner: '원래 요청자만 사용할 수 있어요.',
+         duplicate: '이미 처리 중이거나 완료됐어요.'
+       };
+       await store.schedule(`button-notice:${match[1]}:${notice}`, messages[notice]);
+     }
+   }
+   await tg.call('answerCallbackQuery', { callback_query_id: callback.id }, 3000).catch(() => {});
+   return;
+ }
  const m=u.message;if(!m)return;
  if(m.migrate_to_chat_id){await families.move(m.chat.id,m.migrate_to_chat_id);return;}
  if(m.migrate_from_chat_id){await families.move(m.migrate_from_chat_id,m.chat.id);return;}

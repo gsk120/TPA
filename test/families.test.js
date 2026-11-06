@@ -15,6 +15,40 @@ before(async()=>{db=new PGlite();await db.exec('create role anon;create role aut
 after(async()=>await db.close());
 function telegram({actor='member',botRole='administrator',publicGroup=false}={}){const calls=[];return {calls,call:async(method,args)=>{calls.push({method,args});if(method==='getChat')return {type:'supergroup',...(publicGroup?{username:'public_group'}:{})};return {status:args.user_id===99?botRole:actor};},send:async(chat,text)=>calls.push({chat,text})};}
 let next=1000;const msg=(chat,text,user=1)=>({update_id:next++,message:{message_id:next,chat:{id:chat,type:'supergroup'},from:{id:user,is_bot:false},text}});
+test('button taps acknowledge promptly and queue the same action only once',async()=>{
+ const f=await families.setup(-987,1);
+ const store=families.store(f);
+ const token='11111111-1111-4111-8111-111111111111';
+ const key='button:'+token;
+ await pool.query('insert into assistant.runtime(family_id,key,value) values($1,$2,$3)',
+  [f.id,key,{kind:'undo',actor:'1',chatId:'-987',expiresAt:new Date(Date.now()+60000).toISOString()}]);
+ const tap=async()=>{
+  const tg=telegram();
+  const update_id=next++;
+  await routeUpdate({update_id,callback_query:{
+   id:String(update_id),data:'tpa:'+token+':0',from:{id:1},
+   message:{message_id:321,chat:{id:-987,type:'supergroup'},from:bot}
+  }},families,tg,bot);
+  assert.deepEqual(tg.calls.map(c=>c.method),['answerCallbackQuery']);
+  return tg.calls[0].args.text;
+ };
+ assert.equal(await tap(),undefined);
+ const receipt=await store.claimDelivery();
+ assert.equal(receipt.text,'요청을 접수했어요. 순서대로 처리한 뒤 결과를 알려드릴게요.');
+ assert.equal(await tap(),undefined);
+ const job=await store.claim(key);
+ assert.equal(job.payload.button.messageId,321);
+ assert.equal(await tap(),undefined);
+ assert.match((await store.claimDelivery()).text,/이미 처리 중/);
+ assert.equal(await store.claimDelivery(),null);
+ await store.finish(job,[],'done',null,{consumeButton:token});
+ assert.equal((await store.claimDelivery()).text,'done');
+ assert.equal(await tap(),undefined);
+ assert.equal(await tap(),undefined);
+ assert.match((await store.claimDelivery()).text,/이미 처리됐거나 만료/);
+ assert.equal(await store.claim(),null);
+ assert.equal(await store.claimDelivery(),null);
+});
 test('private group setup is admin-only, idempotent and preserves records',async()=>{
  const tg=telegram();await routeUpdate(msg(-10,'/setup'),families,tg,bot);assert.equal(await families.family(-10),undefined);
  const admin=telegram({actor:'administrator'});await routeUpdate(msg(-10,'/setup'),families,admin,bot);const f=await families.family(-10);assert.equal(f.active,true);

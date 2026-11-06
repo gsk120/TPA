@@ -28,6 +28,13 @@ export async function withControl(root,fn){
  }
  try{return await fn();}finally{await new Promise(r=>server.close(r));}
 }
+// Callers supply fixed diagnostic strings or already-redacted console messages.
+export function writeRuntimeLog(file,level,text){
+  try{
+   if(existsSync(file)&&statSync(file).size>2*1024*1024){if(existsSync(file+'.3'))unlinkSync(file+'.3');for(let i=2;i>=1;i--)if(existsSync(file+'.'+i))renameSync(file+'.'+i,file+'.'+(i+1));renameSync(file,file+'.1');}
+   appendFileSync(file,new Date().toISOString()+' '+level+' '+text.slice(0,2000)+'\n',{mode:0o600});
+  }catch{ /* Logging failure must not expose raw secrets. */ }
+}
 export async function createRuntime(root,onStop,{logging=true,graceMs=60000}={}){
  const p=paths(root);await mkdir(p.dir,{recursive:true});
  let phase='starting',closed=false,stopTimer;
@@ -50,10 +57,7 @@ export async function createRuntime(root,onStop,{logging=true,graceMs=60000}={})
   let text=args.filter(x=>typeof x==='string').join(' ').replace(/postgres(?:ql)?:\/\/[^\s]+/gi,'[DB 비밀값 숨김]').replace(/\b\d{5,}:[A-Za-z0-9_-]{15,}\b/g,'[봇 토큰 숨김]').replace(/\b(?:sk-|sb_secret_)[A-Za-z0-9_-]+/g,'[비밀키 숨김]');
   for(const key of ['TELEGRAM_BOT_TOKEN','DATABASE_URL','OPENAI_API_KEY','CODEX_API_KEY'])if(process.env[key])text=text.split(process.env[key]).join('[비밀값 숨김]');
   try{const password=decodeURIComponent(new URL(process.env.DATABASE_URL).password);if(password)text=text.split(password).join('[DB 비밀번호 숨김]');}catch{}
-  try{
-   if(existsSync(p.log)&&statSync(p.log).size>2*1024*1024){if(existsSync(p.log+'.3'))unlinkSync(p.log+'.3');for(let i=2;i>=1;i--)if(existsSync(p.log+'.'+i))renameSync(p.log+'.'+i,p.log+'.'+(i+1));renameSync(p.log,p.log+'.1');}
-   appendFileSync(p.log,new Date().toISOString()+' '+level+' '+text.slice(0,2000)+'\n',{mode:0o600});
-  }catch{ /* Logging failure must not expose raw secrets. */ }
+  writeRuntimeLog(p.log,level,text);
   originals[level](text);
  }
  if(logging)for(const level of Object.keys(originals))console[level]=(...args)=>log(level,args);

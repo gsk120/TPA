@@ -47,7 +47,7 @@ test('AI receives selected full fields and summary history, cannot edit unseen t
  await processJob({payload:message('서아 불소도포 변경해줘')},s,ai,now);
  assert.deepEqual(input.tasks.map(t=>t.id),[a.id]);assert.equal(input.tasks[0].notes,'keep');assert.equal(input.history[0].before.notes,undefined);assert.equal(input.coverage.historyTruncated,true);assert.equal(input.coverage.familyTaskCount,3);assert.ok(finished[4].conversation);
  const bad={answer:async()=>({reply:'',actions:[{operation:'update',id:b.id,expectedVersion:1,task:{...b,status:'done'},reason:'wrong'}]})};
- await assert.rejects(processJob({payload:message('서아 불소도포 완료')},s,bad,now),/후보 범위/);
+ await assert.rejects(processJob({payload:message('서아 불소도포 변경해줘')},s,bad,now),/후보 범위/);
 });
 
 test('read-only questions cannot mutate and missing edit targets cannot become new tasks',async()=>{

@@ -25,8 +25,8 @@ export class Families {
  async settings(f){const row=(await this.pool.query('select settings,settings_version from assistant.families where id=$1',[f.id])).rows[0];return {...row,settings:validateSettings(row.settings)};}
  async lock(){
   this.lockClient=await this.pool.connect();const r=await this.lockClient.query('select pg_try_advisory_lock(hashtextextended($1,0)) as locked',['tobi:bot:'+this.botId]);
-  if(!r.rows[0].locked){this.lockClient.release();this.lockClient=null;throw new Error('동일한 토비 봇이 이미 실행 중입니다.');}
-  this.lockClient.on('error',()=>process.exit(1));
+  if(!r.rows[0].locked){this.lockClient.release();this.lockClient=null;throw Object.assign(new Error('동일한 토비 봇이 이미 실행 중입니다.'), {code:'BOT_ALREADY_RUNNING'});}
+  this.lockClient.on('error',()=>{console.error('Supabase 운영 잠금 연결이 끊겨 토비를 종료합니다.');process.exit(1);});
   await this.pool.query("update assistant.deliveries set status='uncertain' where status='sending'");
  }
  async close(){if(this.lockClient){await this.lockClient.query('select pg_advisory_unlock_all()').catch(()=>{});this.lockClient.release();}await this.pool.end();}

@@ -69,9 +69,22 @@ export class Store {
   }
   async cursor() { return (await this.pool.query("select value from assistant.runtime where family_id=$1 and key='telegram_offset'", [this.familyId])).rows[0]?.value || 0; }
   async ingest(updateId, payload) {
-    await this.tx(async c => {
-      if (payload) await c.query('insert into assistant.jobs(family_id,id,payload) values($1,$2,$3) on conflict do nothing', [this.familyId, 'tg:' + updateId, payload]);
+    return this.tx(async c => {
+      let queued;
+      if (payload?.button?.messageId) {
+        queued = await c.query(
+          "insert into assistant.jobs(family_id,id,payload) values($1,$2,$3) on conflict(family_id,id) do update set payload=excluded.payload,status='pending',error=null,finished_at=null where assistant.jobs.status='failed'",
+          [this.familyId, 'button:' + payload.button.token, payload]
+        );
+        if (queued.rowCount) {
+          await this.enqueue(c, 'accepted:button:' + payload.button.token,
+            '요청을 접수했어요. 순서대로 처리한 뒤 결과를 알려드릴게요.');
+        }
+      } else if (payload) {
+        queued = await c.query('insert into assistant.jobs(family_id,id,payload) values($1,$2,$3) on conflict do nothing', [this.familyId, 'tg:' + updateId, payload]);
+      }
       await c.query("insert into assistant.runtime(family_id,key,value) values($1,'telegram_offset',to_jsonb($2::bigint)) on conflict(family_id,key) do update set value=to_jsonb(greatest((assistant.runtime.value::text)::bigint,$2::bigint))", [this.familyId, updateId + 1]);
+      return !!queued?.rowCount;
     });
   }
   async claim(id = null) {
@@ -91,6 +104,13 @@ export class Store {
     return this.tx(async c => {
       const r = await c.query("select id from assistant.jobs where family_id=$1 and id=$2 and lease=$3 and status='running' and lease_until>now() for update", [this.familyId, job.id, job.lease]);
       if (!r.rowCount) throw new Error('작업 실행 권한이 만료됐습니다.');
+      if (memory?.consumeButton) {
+        const consumed = await c.query(
+          "update assistant.runtime set value='null'::jsonb where family_id=$1 and key=$2 and value->>'actor'=$3 and value->>'chatId'=$4 and value->>'expiresAt'> $5",
+          [this.familyId, 'button:' + memory.consumeButton, String(job.payload.actor), String(job.payload.chatId), new Date().toISOString()]
+        );
+        if (!consumed.rowCount) throw new Error('버튼이 이미 처리됐거나 만료됐어요.');
+      }
       if(settingsChange){
         const {before,after,version}=settingsChange;
         const changed=await c.query('update assistant.families set settings=$2,settings_version=settings_version+1 where id=$1 and settings_version=$3',[this.familyId,after,version]);
@@ -111,16 +131,20 @@ export class Store {
       await c.query('delete from assistant.context where family_id=$1 and id not in (select id from assistant.context where family_id=$1 order by id desc limit 40)', [this.familyId]);
       await this.enqueue(c, 'reply:' + job.id, reply);
       if(memory){
-        await c.query('update assistant.deliveries set result=$3 where family_id=$1 and id=$2',[this.familyId,'reply:'+job.id,{context:{refs:memory.refs||[],ownerActor:String(job.payload.actor),pending:memory.conversation?.pending||false,requestId:memory.conversation?.requestId||null,expiresAt:memory.expiresAt}}]);
+        if (memory.button) {
+          await c.query('insert into assistant.runtime(family_id,key,value) values($1,$2,$3)',
+            [this.familyId, 'button:' + memory.button.token, memory.button.action]);
+        }
+        await c.query('update assistant.deliveries set result=$3 where family_id=$1 and id=$2',[this.familyId,'reply:'+job.id,{context:{refs:memory.refs||[],ownerActor:String(job.payload.actor),pending:memory.conversation?.pending||false,requestId:memory.conversation?.requestId||null,expiresAt:memory.expiresAt,replyMarkup:memory.button?.markup}}]);
         if(memory.conversation)await c.query('insert into assistant.runtime(family_id,key,value) values($1,$2,$3) on conflict(family_id,key) do update set value=excluded.value',[this.familyId,'conversation:'+String(job.payload.actor),memory.conversation]);
       }
       await c.query("update assistant.jobs set status='done',finished_at=now() where family_id=$1 and id=$2", [this.familyId, job.id]);
     });
   }
-  async fail(job, text) {
+  async fail(job, text, {silent = false} = {}) {
     await this.tx(async c => {
       const r = await c.query("update assistant.jobs set status='failed',error=$4,finished_at=now() where family_id=$1 and id=$2 and lease=$3 and status='running'", [this.familyId, job.id, job.lease, text]);
-      if (r.rowCount) await this.enqueue(c, 'error:' + job.id, '⚠️ 처리를 완료하지 못했어요\n\n' + (/Codex|CLI|doctor/.test(text)?'AI 연결이나 응답에 문제가 있어요. 잠시 후 다시 요청해주세요.':text) + '\n\n문제를 해결한 뒤 같은 내용을 다시 보내주세요.');
+      if (r.rowCount && !silent) await this.enqueue(c, 'error:' + job.id, '⚠️ 처리를 완료하지 못했어요\n\n' + (/Codex|CLI|doctor/.test(text)?'AI 연결이나 응답에 문제가 있어요. 잠시 후 다시 요청해주세요.':text) + '\n\n문제를 해결한 뒤 같은 내용을 다시 보내주세요.');
     });
   }
   async enqueue(c, id, text, task = null) {
@@ -169,7 +193,7 @@ export class Store {
           await c.query('insert into assistant.runtime(family_id,key,value) values($1,$2,$3) on conflict(family_id,key) do update set value=excluded.value',[this.familyId,'message:'+(Number(result.messageIds[i])%1000),value]);
         }
       }
-      await c.query("update assistant.runtime set value='null'::jsonb where family_id=$1 and (key like 'message:%' or key like 'conversation:%') and value->>'expiresAt' < $2",[this.familyId,new Date().toISOString()]);
+      await c.query("update assistant.runtime set value='null'::jsonb where family_id=$1 and (key like 'message:%' or key like 'conversation:%' or key like 'button:%') and value->>'expiresAt' < $2",[this.familyId,new Date().toISOString()]);
     });
   }
   async issues() { return (await this.pool.query("select id,status,created_at from assistant.deliveries where family_id=$1 and status in ('uncertain','failed') order by created_at desc limit 20", [this.familyId])).rows; }

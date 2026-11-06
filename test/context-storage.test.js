@@ -26,6 +26,54 @@ test('related history returns bounded complete counts; memory writes share job t
  await store.ingest(5,{actor:'1',text:'test'});const job=await store.claim();await store.finish(job,[],'ok',null,{refs:[],conversation:{actor:'1',taskIds:[],expiresAt:new Date(Date.now()+60000).toISOString()},expiresAt:new Date(Date.now()+60000).toISOString()});
  await assert.rejects(store.finish(job,[],'bad',null,{refs:[],conversation:{actor:'1',bad:true}}));assert.equal((await store.conversation('1')).bad,undefined);
 });
+
+test('button selection preserves the original request and undo is one-shot under the app role', async () => {
+ const store = await fixture();
+ const tasks = await Promise.all(['2026-12-05', '2026-12-12'].map(async dueDate => {
+  const task = {id:randomUUID(), version:1, title:'우쿠렐레', kind:'appointment', status:'open',
+   dueDate, time:'09:30', endDate:null, timeNote:null, person:null, assignee:null, notes:null,
+   followUpDate:null, actualDeadline:null, remindAt:[]};
+  await pool.query('insert into assistant.tasks(family_id,id,version,data) values($1,$2,1,$3)', [store.familyId,task.id,task]);
+  return task;
+ }));
+ const payload = {actor:'1', chatId:'-10', text:'우쿠렐레 완료'};
+ const process = async (id, extra, answer) => {
+  await store.ingest(id, {...payload,...extra});
+  return processJob(await store.claim('tg:'+id), store, answer && {answer});
+ };
+ const press = (markup, index) => {
+  const [,token,choice] = markup.inline_keyboard[index][0].callback_data.split(':');
+  return {token,index:Number(choice)};
+ };
+ await db.exec('set role assistant_app');
+ try {
+  await process(100, {}, async () => ({actions:[], clarification:{
+   operation:'update', candidateIds:tasks.map(t => t.id), proposedChanges:[{field:'status',value:'done'}],
+   question:'어느 일정인가요?', unresolved:'대상'
+  }}));
+  const choice = await store.claimDelivery();
+  const markup = (await store.referencesForDelivery(choice)).replyMarkup;
+  assert.deepEqual(markup.inline_keyboard.map(row => row[0].text), tasks.map(t => t.dueDate+' 09:30 · 우쿠렐레'));
+  await store.deliveryResult(choice,'pending',{},0);
+  const retry = await store.claimDelivery();
+  assert.deepEqual((await store.referencesForDelivery(retry)).replyMarkup,markup);
+  await store.deliveryResult(retry,'sent',{});
+  const selected = press(markup,1);
+  await process(101,{text:'일정 대상 선택',button:selected},async input => {
+   assert.equal(input.message.text,payload.text);
+   assert.deepEqual(input.tasks.map(t => t.id),[tasks[1].id]);
+   return {actions:[{operation:'update',id:tasks[1].id,expectedVersion:1,task:{...tasks[1],status:'done'}}]};
+  });
+  const receipt = await store.claimDelivery();
+  const undo = press((await store.referencesForDelivery(receipt)).replyMarkup,0);
+  await assert.rejects(process(102,{actor:'2',button:undo}),/버튼/);
+  await process(103,{text:'방금 변경 되돌리기',button:undo});
+  assert.deepEqual((await store.tasks()).map(t => [t.id,t.status,t.version]).sort(),
+   [[tasks[0].id,'open',1],[tasks[1].id,'open',3]].sort());
+  await assert.rejects(process(104,{button:undo}),/이미 처리/);
+ } finally { await db.exec('reset role'); }
+});
+
 test('runtime cleanup and reference writes work under actual app-role grants',async()=>{
  const store=await fixture();await store.schedule('test','확인');const d=await store.claimDelivery();await db.exec('set role assistant_app');try{await store.deliveryResult(d,'sent',{messageIds:[5],messageRefs:[[]],chatId:'-10'});assert.equal((await store.replyReference(5)).chatId,'-10');}finally{await db.exec('reset role');}
 });

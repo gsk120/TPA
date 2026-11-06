@@ -1,17 +1,30 @@
 import {spawn} from 'node:child_process';
-import {readFile,stat} from 'node:fs/promises';
+import {mkdir,readFile,stat} from 'node:fs/promises';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {root} from './config.js';
-import {paths,request,readState,withControl} from './runtime.js';
+import {paths,request,readState,withControl,writeRuntimeLog} from './runtime.js';
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 async function hasState(base){try{await stat(paths(base).state);return true;}catch{return false;}}
 export async function start(base=root,{entry=path.join(base,'src','main.js'),timeout=30000}={}){
  const current=await request(base);if(current){console.log('토비가 이미 실행 중이에요: '+current.phase);return current;}
+ const runtimePaths=paths(base);
+ await mkdir(runtimePaths.dir,{recursive:true});
+ writeRuntimeLog(runtimePaths.log,'log','토비 기동 · 백그라운드 프로세스 시작 요청');
  const child=spawn(process.execPath,['--env-file-if-exists='+path.join(base,'.env'),entry],{cwd:base,detached:true,windowsHide:true,stdio:'ignore',env:{...process.env}});
- let failed=false;child.on('error',()=>{failed=true;});child.unref();
+ let failed=false, exited=false;
+ child.on('error',error=>{
+  failed=true;
+  const code=['ENOENT','EACCES','EPERM','EINVAL','EAGAIN'].includes(error.code)?error.code:'원인 코드 없음';
+  writeRuntimeLog(runtimePaths.log,'error','토비 프로세스 생성 실패 · '+code);
+ });
+ child.once('exit',(code,signal)=>{
+  exited=true;
+  writeRuntimeLog(runtimePaths.log,'error','토비 기동 프로세스 종료 · '+(signal||'종료 코드 '+code));
+ });
+ child.unref();
  const until=Date.now()+timeout;let seen=false;
- while(Date.now()<until){if(failed)throw new Error('토비 프로세스를 시작하지 못했어요.');const s=await request(base);if(s){seen=true;if(s.phase==='running'){console.log('토비 백그라운드 실행 완료. 터미널을 닫아도 유지됩니다.');return s;}if(s.phase==='stopping')throw new Error('토비가 종료 중입니다.');}else if(seen)throw new Error('토비가 시작 중 종료됐어요. bot:logs로 확인하세요.');await sleep(300);}
+ while(Date.now()<until){if(failed)throw new Error('토비 프로세스를 시작하지 못했어요.');const s=await request(base);if(s){seen=true;if(s.phase==='running'){console.log('토비 백그라운드 실행 완료. 터미널을 닫아도 유지됩니다.');return s;}if(s.phase==='stopping')throw new Error('토비가 종료 중입니다.');}else if(seen||exited)throw new Error('토비가 시작 중 종료됐어요. bot:logs로 확인하세요.');await sleep(300);}
  const state=await request(base);if(state){console.log('토비가 시작 중이에요. bot:status와 bot:logs로 확인하세요.');return state;}
  throw new Error('시작 상태를 확인하지 못했어요. bot:logs로 확인하세요.');
 }
