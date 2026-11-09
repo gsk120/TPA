@@ -1,0 +1,48 @@
+#!/bin/sh
+# Project-local launcher: never changes the calling shell or the system Node.
+set -eu
+TPA_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+TPA_NODE_DIR=/Users/ibksystem/.local/share/tpa-tools/node-v22.23.4-darwin-x64
+TPA_CODEX_DIR=/Users/ibksystem/.local/share/tpa-tools/codex
+TPA_NODE="$TPA_NODE_DIR/bin/node"
+TPA_NPM="$TPA_NODE_DIR/lib/node_modules/npm/bin/npm-cli.js"
+if [ ! -x "$TPA_NODE" ] || [ ! -r "$TPA_NPM" ]; then
+  echo 'TPA 전용 Node.js/npm 설치 경로를 확인하세요.' >&2
+  exit 1
+fi
+export PATH="$TPA_NODE_DIR/bin:$TPA_CODEX_DIR/bin:$PATH"
+# Allow a slower IPv4 handshake before trying an unavailable alternate address.
+# Inherited by npm's detached Node child, but never exported to the caller.
+export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--network-family-autoselection-attempt-timeout=1500"
+cd "$TPA_ROOT"
+case "${1:-help}" in
+  start|stop|restart|status|logs)
+    TPA_COMMAND=$1
+    shift
+    exec "$TPA_NODE" "$TPA_NPM" run "bot:$TPA_COMMAND" -- "$@"
+    ;;
+  follow)
+    if [ ! -f data/runtime/tobi.log ]; then
+      echo '아직 로그 파일이 없습니다. 봇 시작 후 다시 실행하세요.'
+      exit 0
+    fi
+    exec /usr/bin/tail -n 60 -F data/runtime/tobi.log
+    ;;
+  npm)
+    shift
+    exec "$TPA_NODE" "$TPA_NPM" "$@"
+    ;;
+  versions)
+    "$TPA_NODE" --version
+    "$TPA_NODE" "$TPA_NPM" --version
+    exec "$TPA_NODE" "$TPA_CODEX_DIR/lib/node_modules/@openai/codex/bin/codex.js" --version
+    ;;
+  help|-h|--help)
+    echo '사용법: ./tpa start|stop|restart|status|logs [줄수]|follow|versions'
+    echo '기존 npm 명령: ./tpa npm run bot:status (이 프로젝트의 전용 Node 사용)'
+    ;;
+  *)
+    echo '지원하지 않는 명령입니다. ./tpa help로 확인하세요.' >&2
+    exit 2
+    ;;
+esac

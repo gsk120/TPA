@@ -1,6 +1,6 @@
 import net from 'node:net';
 import {createHash,randomBytes} from 'node:crypto';
-import {mkdir,readFile,writeFile,rename,unlink} from 'node:fs/promises';
+import {mkdir,readFile,writeFile,rename,unlink,lstat,rmdir} from 'node:fs/promises';
 import {appendFileSync,statSync,renameSync,existsSync,unlinkSync} from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -20,10 +20,39 @@ export async function request(root,command='status',timeout=2500){
   socket.on('end',()=>finish(null));
  });
 }
+const listen = (server,endpoint) => new Promise((ok,no)=>{
+ server.once('error',no);server.listen(endpoint,()=>{server.removeListener('error',no);ok();});
+});
+// Serialize bind/recovery across cooperating processes. Never infer socket ownership
+// from a PID or an unauthenticated protocol response. Ambiguous errors fail closed.
+async function listenEndpoint(server,endpoint){
+ if(process.platform==='win32')return listen(server,endpoint);
+ const guard=endpoint+'.recovery';
+ for(let i=0;;i++){
+  try{await mkdir(guard,{mode:0o700});break;}
+  catch(e){if(e.code!=='EEXIST'||i>=40)throw Object.assign(new Error('Socket recovery busy'),{code:'EADDRINUSE'});await new Promise(r=>setTimeout(r,250));}
+ }
+ try{
+  try{return await listen(server,endpoint);}catch(e){if(e.code!=='EADDRINUSE')throw e;}
+  const before=await lstat(endpoint);
+  if(!before.isSocket()||before.uid!==process.getuid())throw Object.assign(new Error('Socket ownership uncertain'),{code:'EADDRINUSE'});
+  const refused=await new Promise(resolve=>{
+   const socket=net.createConnection(endpoint);let done=false;
+   const finish=value=>{if(done)return;done=true;socket.destroy();resolve(value);};
+   socket.setTimeout(1000,()=>finish(false));socket.once('connect',()=>finish(false));
+   socket.once('error',e=>finish(e.code==='ECONNREFUSED'));
+  });
+  if(!refused)throw Object.assign(new Error('Socket is active or uncertain'),{code:'EADDRINUSE'});
+  const current=await lstat(endpoint);
+  if(!current.isSocket()||current.uid!==before.uid||current.dev!==before.dev||current.ino!==before.ino||current.ctimeMs!==before.ctimeMs)throw Object.assign(new Error('Socket changed'),{code:'EADDRINUSE'});
+  await unlink(endpoint);
+  await listen(server,endpoint);
+ }finally{await rmdir(guard);}
+}
 export async function withControl(root,fn){
  const endpoint=paths(root).pipe+'-control';const server=net.createServer(s=>s.destroy());
  for(let i=0;;i++){
-  try{await new Promise((ok,no)=>{server.once('error',no);server.listen(endpoint,()=>{server.removeListener('error',no);ok();});});break;}
+  try{await listenEndpoint(server,endpoint);break;}
   catch(e){if(e.code!=='EADDRINUSE'||i>=40)throw new Error('다른 운영 명령이 실행 중이에요. 잠시 후 다시 시도하세요.');await new Promise(r=>setTimeout(r,250));}
  }
  try{return await fn();}finally{await new Promise(r=>server.close(r));}
@@ -49,7 +78,7 @@ export async function createRuntime(root,onStop,{logging=true,graceMs=60000}={})
    socket.end(JSON.stringify({id:p.id,pid:state.pid,instance:state.instance,phase,startedAt:state.startedAt})+'\n');
   });
  });
- await new Promise((ok,no)=>{server.once('error',no);server.listen(p.pipe,()=>{server.removeListener('error',no);ok();});});
+ await listenEndpoint(server,p.pipe);
  try{const tmp=p.state+'.'+state.instance;await writeFile(tmp,JSON.stringify(state),{mode:0o600});await rename(tmp,p.state);}catch(e){server.close();throw e;}
  const originals={log:console.log,error:console.error,warn:console.warn};
  function log(level,args){

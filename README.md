@@ -108,6 +108,10 @@ npm run bot:start
 
 ## 운영
 
+macOS에서 수동으로 운영하는 경우 [macOS 수동 운영 안내](MACOS-MANUAL.md)를 참고합니다.
+프로젝트 전용 `./tpa start / stop / restart / status / logs / follow` 실행기가 기존 npm 명령을 사용하며,
+시스템 Node나 셸 설정은 변경하지 않습니다. Windows 봇을 종료하고 전환을 승인하기 전에는 Mac 봇을 시작하지 않습니다.
+
 ```powershell
 npm run bot:start
 npm run bot:status
