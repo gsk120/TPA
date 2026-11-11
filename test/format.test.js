@@ -18,6 +18,42 @@ test('empty list, timezone and completed exclusion',()=>{
  assert.ok(formatList([],'today',now).includes('없어요'));assert.equal(listTasks([task({status:'done'})],'all',now).length,0);assert.ok(formatList([],'today',now,'America/New_York').includes('11월 1일(일)'));
  assert.ok(briefing([task()], 'daily',now).includes('☐ 서아 등록'));assert.ok(!briefing([task()], 'daily',now).includes(task().id));
 });
+test('event summaries distinguish a scheduled visit, a time condition and an event period',()=>{
+ const event=task({title:'코엑스 유교전',kind:'event'});
+ assert.equal(displayTask({...event,time:'09:00',timeNote:'입구에서 만나기'}),'• 오전 9시 · 코엑스 유교전 · 입구에서 만나기');
+ assert.equal(displayTask({...event,endDate:event.dueDate}),'• 코엑스 유교전 · 방문 시간 미정');
+ assert.equal(displayTask({...event,timeNote:'14시 이후'}),'• 코엑스 유교전 · 14시 이후');
+ assert.equal(displayTask({...event,endDate:'2026-11-05'}),'• 코엑스 유교전 · 2026-11-02~2026-11-05 · 방문일 미정');
+ assert.equal(displayTask({...event,dueDate:null}),'• 코엑스 유교전');
+});
+test('natural and slash schedule queries display a saved event time in each scope',async()=>{
+ const event=task({title:'코엑스 유교전',kind:'event',time:'09:00'});
+ const future=task({title:'다음 달 행사',kind:'event',dueDate:'2026-12-02'});
+ const store={tasks:async()=>[event,future],finish:async(_job,changes)=>assert.deepEqual(changes,[])};
+ const ai={answer:()=>assert.fail('a clear list request should skip AI')};
+ for(const [command,phrases] of [
+  ['/today',['오늘일정알려줘','오늘 일정 뭐지?']],
+  ['/list',['전체일정알려줘','전체 목록 보여줘']],
+  ['/week',['이번주일정알려줘','이번 주 남은 일정 보여줘']]
+ ]){
+  const reply=await processJob({payload:{text:command}},store,ai,now);
+  assert.match(reply,/오전 9시 · 코엑스 유교전/);
+  assert.doesNotMatch(reply,/방문일 미정/);
+  assert.equal(reply.includes(future.title),command==='/list');
+  for(const text of phrases)assert.equal(await processJob({payload:{text}},store,ai,now),reply);
+ }
+});
+test('an interpreted schedule request uses the same event summary',async()=>{
+ const event=task({title:'코엑스 유교전',kind:'event',time:'09:00'});
+ const store={tasks:async()=>[event],finish:async(_job,changes)=>assert.deepEqual(changes,[])};
+ const ai={answer:async()=>({
+  actions:[],reply:'',
+  retrieval:{kind:'task_list',status:'active',from:'2026-11-02',to:'2026-11-02',person:null,search:null}
+ })};
+ const reply=await processJob({payload:{text:'오늘 잡혀 있는 일정이 뭐였더라?'}},store,ai,now);
+ assert.match(reply,/오전 9시 · 코엑스 유교전/);
+ assert.doesNotMatch(reply,/방문일 미정/);
+});
 test('detail hides technical IDs unless explicitly requested',()=>{
  const t=task({notes:'참고 <>&_*',time:'09:00'});assert.ok(!formatDetail(t).includes(t.id));assert.ok(formatDetail(t,{showId:true}).includes(t.id));assert.ok(formatDetail(t).includes('참고 <>&_*'));const text=formatReceipt([{before:null,after:t}]);assert.ok(text.startsWith('✅ 저장 완료'));assert.ok(!text.includes(t.id));
 });

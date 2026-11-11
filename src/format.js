@@ -8,7 +8,13 @@ export function displayTask(t,{deadline=true}={}){
  let line;
  if(isTask)line=`☐ ${title}${t.time?' · '+clockLabel(t.time):''}${deadline&&t.dueDate?' · 이날까지':''}`;
  else if(t.kind==='registration')line=`• ${clockLabel(t.time)} · ${title}${t.timeNote?.includes('접수')?' · '+clean(t.timeNote):' · 접수 시작'}`;
- else if(t.kind==='event')line=`• ${title}${t.endDate?' · '+t.dueDate+'~'+t.endDate:''} · ${clean(t.timeNote)||'방문일 미정'}`;
+ else if(t.kind==='event'){
+  const spansDays=t.dueDate&&t.endDate>t.dueDate;
+  const period=spansDays?`${t.dueDate}~${t.endDate}`:'';
+  const note=clean(t.timeNote);
+  const visitStatus=t.dueDate&&(spansDays?'방문일 미정':'방문 시간 미정');
+  line='• '+[t.time&&clockLabel(t.time),title,period,note||(!t.time&&visitStatus)].filter(Boolean).join(' · ');
+ }
  else line=`• ${t.time?clockLabel(t.time):clean(t.timeNote)||'시간 미정'} · ${title}`;
  if(t.timeNote&&(t.time||isTask)&&!['registration','event'].includes(t.kind))line+=' · '+clean(t.timeNote);
  if(['waiting','in_progress','done','cancelled'].includes(t.status))line+=' · '+statusLabel[t.status];

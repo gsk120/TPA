@@ -3,9 +3,10 @@ import {today,addDays,validDay} from './time.js';
 const compact=s=>String(s||'').normalize('NFKC').toLowerCase().replace(/[\s?!.,~]/g,'');
 export function quickCommand(text){
  const s=compact(text).replace(/^!/,'');
- if(/^(?:전체|전부|모든|남은)(?:일정|목록|할일|과업)(?:을|를)?(?:전부|전체|모두)?(?:알려줘|보여줘|띄워줘|알려주세요|보여주세요|조회해줘)?$/.test(s))return '/list';
- const map={list:['전체목록','전체목록알려줘','전체일정알려줘','남은일정알려줘','남은목록알려줘'],today:['오늘일정','오늘일정알려줘','오늘할일알려줘','오늘뭐해야해'],week:['이번주일정','이번주일정알려줘','이번주할일알려줘'],help:['명령어알려줘','사용법알려줘','도움말']};
- for(const [command,phrases] of Object.entries(map))if(phrases.includes(s))return '/'+command;
+ const lookup=s.match(/^(오늘|이번주|전체|전부|모든|남은)(?:의)?(?:남은)?(?:일정|목록|할일|과업)(?:은|는|을|를|이|가)?(?:전부|전체|모두)?(?:알려줘|알려주세요|보여줘|보여주세요|띄워줘|조회해줘|뭐지|뭐야|뭐있어|뭐가있어|뭐있지|뭐가있지)?$/u);
+ if(lookup)return {오늘:'/today',이번주:'/week',전체:'/list',전부:'/list',모든:'/list',남은:'/list'}[lookup[1]];
+ if(s==='오늘뭐해야해')return '/today';
+ if(['명령어알려줘','사용법알려줘','도움말'].includes(s))return '/help';
  return null;
 }
 export function followup(text){if(/추가|새로/.test(text))return false;if(/(?:일정|목록|할\s*일|과업)/.test(text)&&/(?:알려|보여|띄워|조회)/.test(text)&&!/(?:바꿔|변경|미뤄|완료|취소|수정)/.test(text))return false;return /^(?:그거|그건|그걸|그것|\d+(?:번|번째)?(?:[야요!.\s]|$)|둘\s*다|두\s*개|전부|모두|첫\s*번째|두\s*번째|마지막|응|네|예|맞아|완료|끝|했어|했음|내일로|모레로|다음\s*주(?:로|\s)|이번\s*주\s|[월화수목금토일]요일(?:로|\s|$)|미뤄|취소|오전|오후|\d{1,2}[.:월시일])/u.test(text.trim());}
