@@ -6,6 +6,7 @@ import {formatList,formatReceipt,formatDetail,groupTasks} from './format.js';
 import { listTasks, briefing } from './briefing.js';
 import { addDays, dueBriefs, kst, today } from './time.js';
 import {defaults,validateSettings,settingsText} from './settings.js';
+import {processWeekly} from './weekly.js';
 import {quickCommand,selectContext,nextConversation,summarizeHistory,searchTerms,settingsIntent,validateClarification,detailQuery,detailCandidates,selectedDetail} from './context.js';
 
 export const supportedCommands = ['today','week','list','settings','help'];
@@ -127,12 +128,16 @@ function duplicateTargets(text, tasks, completion, now, timeZone) {
 }
 
 export async function processJob(job, store, ai, now = new Date(), signal, options = {}) {
+  const actorState=await store.conversation?.(job.payload.actor)||null;
+  if (!job.payload.button) {
+    const weeklyReply = await processWeekly(job, store, now, options, actorState);
+    if (weeklyReply !== null) return weeklyReply;
+  }
   const tasks = await store.tasks();
   const buttonInput = job.payload.button ? await processButton(job, store, tasks, now, options) : null;
   if (buttonInput?.reply) return buttonInput.reply;
   const originalText = buttonInput?.action.text ?? job.payload.text.trim();
   const naturalDetail=detailQuery(originalText);
-  const actorState=await store.conversation?.(job.payload.actor)||null;
   let detailReplyAllowed=!job.payload.replyTo;
   if(job.payload.replyTo&&actorState?.pending){try{const r=await store.replyReference?.(JSON.parse(job.payload.replyTo).id);detailReplyAllowed=r?.requestId===actorState.requestId&&r?.ownerActor===String(job.payload.actor)&&r?.chatId===String(job.payload.chatId)&&Date.parse(r?.expiresAt)>now.getTime();}catch{}}
   const validDetailState=detailReplyAllowed&&actorState?.pending&&actorState.request?.operation==='detail'&&Date.parse(actorState.expiresAt)>now.getTime();
@@ -166,6 +171,12 @@ export async function processJob(job, store, ai, now = new Date(), signal, optio
       candidates:[buttonInput.task], context:[], request:buttonInput.action.request,
       continuation:true, coverage:{scope:'button', providedTaskCount:1}
     } : selectContext(activeTasks,job.payload,previous,reference,now,current.timeZone);
+    if (selection.request?.operation === 'weekly') {
+      const reply = selection.request.question;
+      await options.authorize?.();
+      await store.finish(job, [], reply);
+      return reply;
+    }
     const awaitingTarget = previous?.pending && previous.actor === String(job.payload.actor)
       && Date.parse(previous.expiresAt) > +now && previous.request?.chooseByDate
       && (!job.payload.replyTo || (reference?.requestId === previous.requestId

@@ -104,6 +104,32 @@ export class Store {
     return this.tx(async c => {
       const r = await c.query("select id from assistant.jobs where family_id=$1 and id=$2 and lease=$3 and status='running' and lease_until>now() for update", [this.familyId, job.id, job.lease]);
       if (!r.rowCount) throw new Error('작업 실행 권한이 만료됐습니다.');
+      if (memory?.weeklyConfirmation) {
+        const {rows} = await c.query('select value from assistant.runtime where family_id=$1 and key=$2 for update',
+          [this.familyId, 'conversation:' + String(job.payload.actor)]);
+        if (!rows[0]?.value?.pending || rows[0].value.requestId !== memory.weeklyConfirmation) {
+          throw new Error('반복 일정 확인 요청이 이미 처리됐거나 바뀌었어요.');
+        }
+      }
+      if (memory?.weeklyKey) {
+        const key = [this.familyId, memory.weeklyKey];
+        const inserted = changes.length && (await c.query(
+          'insert into assistant.runtime(family_id,key,value) values($1,$2,$3) on conflict do nothing',
+          [...key, {reply, refs:memory.refs}]
+        )).rowCount;
+        if (!inserted) {
+          const {rows} = await c.query('select value from assistant.runtime where family_id=$1 and key=$2', key);
+          const saved = rows[0]?.value;
+          if (saved) {
+            changes = [];
+            reply = '이미 처리된 요청이에요. 이번에 새로 등록한 일정은 0건이에요.\n\n이전 등록 결과\n' + saved.reply;
+            memory.refs = saved.refs;
+            memory.conversation.taskIds = saved.refs.map(t => t.id);
+            memory.conversation.request.candidateOrder = memory.conversation.taskIds;
+            memory.conversation.turns.at(-1).text = reply.slice(0, 1600);
+          }
+        }
+      }
       if (memory?.consumeButton) {
         const consumed = await c.query(
           "update assistant.runtime set value='null'::jsonb where family_id=$1 and key=$2 and value->>'actor'=$3 and value->>'chatId'=$4 and value->>'expiresAt'> $5",
@@ -139,12 +165,18 @@ export class Store {
         if(memory.conversation)await c.query('insert into assistant.runtime(family_id,key,value) values($1,$2,$3) on conflict(family_id,key) do update set value=excluded.value',[this.familyId,'conversation:'+String(job.payload.actor),memory.conversation]);
       }
       await c.query("update assistant.jobs set status='done',finished_at=now() where family_id=$1 and id=$2", [this.familyId, job.id]);
+      return reply;
     });
   }
-  async fail(job, text, {silent = false} = {}) {
+  async fail(job, text, {silent = false, weeklySave = false} = {}) {
     await this.tx(async c => {
       const r = await c.query("update assistant.jobs set status='failed',error=$4,finished_at=now() where family_id=$1 and id=$2 and lease=$3 and status='running'", [this.familyId, job.id, job.lease, text]);
-      if (r.rowCount && !silent) await this.enqueue(c, 'error:' + job.id, '⚠️ 처리를 완료하지 못했어요\n\n' + (/Codex|CLI|doctor/.test(text)?'AI 연결이나 응답에 문제가 있어요. 잠시 후 다시 요청해주세요.':text) + '\n\n문제를 해결한 뒤 같은 내용을 다시 보내주세요.');
+      if (r.rowCount && !silent) {
+        // An uncertain COMMIT can only be reported as a rollback if this job is still running.
+        const reason = weeklySave ? '일괄 저장이 취소되어 등록된 일정은 0건이에요.'
+          : /Codex|CLI|doctor/.test(text) ? 'AI 연결이나 응답에 문제가 있어요. 잠시 후 다시 요청해주세요.' : text;
+        await this.enqueue(c, 'error:' + job.id, '⚠️ 처리를 완료하지 못했어요\n\n' + reason + '\n\n문제를 해결한 뒤 같은 내용을 다시 보내주세요.');
+      }
     });
   }
   async enqueue(c, id, text, task = null) {

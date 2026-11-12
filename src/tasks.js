@@ -26,6 +26,15 @@ export function validateTask(input, now = new Date()) {
   if (task.remindAt.some(v => Date.parse(v) <= now.getTime())) throw new Error('이미 지난 시각을 새 알림으로 설정할 수 없습니다.');
   return task;
 }
+export function planTaskCreation(input, reason, now) {
+  const data = validateTask(input, now);
+  const timestamp = now.toISOString();
+  return {
+    before: null,
+    after: {...data, id: randomUUID(), version: 1, completedAt: data.status === 'done' ? timestamp : null, createdAt: timestamp, updatedAt: timestamp},
+    reason
+  };
+}
 export function planChanges(actions, currentTasks, now = new Date()) {
   if (!Array.isArray(actions) || actions.length > 20) throw new Error('한 번에 최대 20개를 변경할 수 있습니다.');
   const map = new Map(currentTasks.map(t => [t.id, structuredClone(t)]));
@@ -39,12 +48,12 @@ export function planChanges(actions, currentTasks, now = new Date()) {
       if (timingChanged && JSON.stringify(proposed.remindAt) === JSON.stringify(previous.remindAt)) proposed.remindAt = [];
       else proposed.remindAt = proposed.remindAt.filter(v=>!(previous.remindAt.includes(v) && Date.parse(v)<=now.getTime()));
     }
-    const data = validateTask(proposed, now);
     if (action.operation === 'create') {
       if (action.id !== null || action.expectedVersion !== null) throw new Error('신규 과업 식별자를 확인하세요.');
-      const next = { ...data, id: randomUUID(), version: 1, completedAt: data.status === 'done' ? now.toISOString() : null, createdAt: now.toISOString(), updatedAt: now.toISOString() };
-      changes.push({ before: null, after: next, reason: action.reason || '' }); map.set(next.id, next);
+      const change = planTaskCreation(proposed, action.reason || '', now);
+      changes.push(change); map.set(change.after.id, change.after);
     } else {
+      const data = validateTask(proposed, now);
       const old = map.get(action.id);
       if (!old || old.version !== action.expectedVersion || seen.has(action.id)) throw new Error('목록이 변경됐거나 대상을 찾지 못했습니다. 다시 요청해주세요.');
       seen.add(action.id);

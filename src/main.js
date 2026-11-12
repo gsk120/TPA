@@ -76,7 +76,8 @@ async function main(stage){
      }
     }catch(e){
      if(job)await store.fail(job,safeError(e), {
-       silent: !!job.payload.button && e.message === '버튼이 이미 처리됐거나 만료됐어요.'
+       silent: !!job.payload.button && e.message === '버튼이 이미 처리됐거나 만료됐어요.',
+       weeklySave: e.message === '반복 일정 저장 오류'
      }).catch(()=>{});
     }
     finally{clearInterval(timer);busy.delete(f.id);}

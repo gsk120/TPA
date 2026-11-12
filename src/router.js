@@ -72,5 +72,5 @@ export async function routeUpdate(u,families,tg,bot){
  const reply=m.reply_to_message;
  // Only retain bot reply context, never unrelated family conversation.
  const replyTo=reply?.from?.id===bot.id?JSON.stringify({id:reply.message_id,chatId:String(m.chat.id),actor:String(bot.id),text:reply.text?.slice(0,2000)}):null;
- await families.store(f).ingest(u.update_id,{actor:String(m.from.id),text:text.slice(0,8000),messageId:m.message_id,chatId:String(m.chat.id),replyTo});
+ await families.store(f).ingest(u.update_id,{actor:String(m.from.id),text:text.slice(0,8000),messageId:m.message_id,chatId:String(m.chat.id),replyTo,sentAt:m.date});
 }
