@@ -22,6 +22,8 @@
     "bot:restart": "node src/control.js restart"
   },
   "dependencies": {
+    "@langchain/core": "^1.4.1",
+    "@langchain/langgraph": "^1.7.4",
     "pg": "^8.16.3"
   },
   "devDependencies": {

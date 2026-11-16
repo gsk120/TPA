@@ -13,7 +13,18 @@ export function followup(text){if(/추가|새로/.test(text))return false;if(/(?
 export const settingsIntent=text=>/(?:점검|알림|시간대|타임존)/.test(text)&&/(?:매일|매주|주간|일일|중지|재개|설정|시간대|타임존)/.test(text);
 const stops=new Set(['일정','과업','할일','목록','오늘','내일','모레','이번주','다음주','지난주','전체','모두','관련','언제','왜','뭐','뭐야','그거','그건','그걸','그것','알려줘','보여줘','조회','찾아줘','해주세요','해줘','추가','추가해줘','등록','등록해줘','예약','변경','변경해줘','미뤄줘','바꿔줘','완료','완료했어','완료해줘','취소','취소해줘','끝','했어','지난','작년','올해','다음','현재','준비','오전','오후','까지','결정','날짜','시간']);
 export function searchTerms(text){return [...new Set((text.match(/[가-힣A-Za-z0-9_-]+/gu)||[]).map(t=>t.replace(/(?:했는데|했어|해줘|까지|으로|한테|에게|에서|은|는|을|를|이|가|도|에|로)$/u,'')).filter(t=>t.length>=2&&!/^\d+$/.test(t)&&!stops.has(t)&&!/[월일시분]$/.test(t)))].slice(0,12);}
-export function selectContext(tasks,message,state,reference,now=new Date(),timeZone='Asia/Seoul'){
+function matchTarget(tasks, target) {
+ const normalized = compact(target);
+ if (!normalized) return [];
+ const exact = tasks.filter(t => compact(t.title) === normalized);
+ if (exact.length) return exact;
+ const partial = tasks.filter(t => compact(t.title).includes(normalized));
+ if (partial.length) return partial;
+ const terms = searchTerms(target);
+ return terms.length ? tasks.filter(t => terms.every(term => compact(t.title+' '+(t.person||'')).includes(compact(term)))) : [];
+}
+
+export function selectContext(tasks,message,state,reference,now=new Date(),timeZone='Asia/Seoul',targetQueries=null){
  const text=message.text.trim(),validState=state&&String(state.actor)===String(message.actor)&&Date.parse(state.expiresAt)>now.getTime()?state:null;
  const hasReply=!!message.replyTo;let candidates=[],reason='keyword',blocked=null,continuation=false;
  const selectionOnly=/(?:만|만\s*빼고|제외)[야요!.\s]*$/.test(text)||/^(?:둘\s*다|두\s*개|전부|모두|첫\s*번째|두\s*번째|마지막|응|네|예|맞아)[야요!.\s]*$/.test(text);
@@ -32,8 +43,10 @@ export function selectContext(tasks,message,state,reference,now=new Date(),timeZ
  const exact=tasks.filter(t=>(compact(t.title).length>=2&&normalized.includes(compact(t.title)))||(t.id&&text.includes(t.id)));
  const scored=tasks.map(t=>({task:t,score:terms.reduce((n,q)=>n+(compact(t.title+' '+(t.person||'')).includes(compact(q))?1:0),0)}));
  const max=scored.reduce((n,t)=>Math.max(n,t.score),0);
- const multiple=/(이랑|하고|그리고|\s및\s|[와과]\s)/.test(text);
- const matches=multiple?[...new Map([...exact,...scored.filter(t=>t.score>0).map(t=>t.task)].map(t=>[t.id,t])).values()]:exact.length?exact:scored.filter(t=>t.score===max&&max>0).map(t=>t.task);
+ const multiple=/(이랑|하고|그리고|\s및\s)/.test(text);
+ const matches=targetQueries?.length
+  ? [...new Map(targetQueries.flatMap(query=>matchTarget(tasks,query)).map(t=>[t.id,t])).values()]
+  : targetQueries===null&&multiple?[...new Map([...exact,...scored.filter(t=>t.score>0).map(t=>t.task)].map(t=>[t.id,t])).values()]:exact.length?exact:scored.filter(t=>t.score===max&&max>0).map(t=>t.task);
  if(!blocked){
   if(!hasReply&&validState?.pending&&shortSelection&&!/추가|새로/.test(text)&&!exact.some(t=>!(validState.taskIds||[]).includes(t.id))){
    continuation=true;reason='followup';candidates=ordered(validState.taskIds);

@@ -77,3 +77,89 @@ test('button selection preserves the original request and undo is one-shot under
 test('runtime cleanup and reference writes work under actual app-role grants',async()=>{
  const store=await fixture();await store.schedule('test','확인');const d=await store.claimDelivery();await db.exec('set role assistant_app');try{await store.deliveryResult(d,'sent',{messageIds:[5],messageRefs:[[]],chatId:'-10'});assert.equal((await store.replyReference(5)).chatId,'-10');}finally{await db.exec('reset role');}
 });
+
+test('LangGraph registers a new appointment with many similar records and deduplicates the job', async () => {
+ const store = await fixture();
+ const now = new Date('2025-04-08T08:00:00Z');
+ const task = {
+  title:'가상인물A 피부과 방문', kind:'appointment', status:'open', dueDate:'2025-05-12', time:'16:40',
+  endDate:null, timeNote:null, person:'가상인물A', assignee:null, notes:null, followUpDate:null,
+  actualDeadline:null, remindAt:[]
+ };
+ for (let i = 0; i < 13; i++) {
+  const old = {...task, id:randomUUID(), version:1, title:i % 2 ? '가상인물A 운동회' : '가상인물B 피부과', dueDate:'2025-04-03'};
+  await pool.query('insert into assistant.tasks(family_id,id,version,data) values($1,$2,1,$3)', [store.familyId,old.id,old]);
+ }
+ let calls = 0;
+ const ai = {
+  classify:async ({message}) => {
+   calls++;
+   assert.match(message.text, /16시 40분 가상인물A 피부과 방문 추가/);
+   return {intent:'create', targets:[], answer:{reply:'', actions:[{
+    operation:'create', id:null, expectedVersion:null, task
+   }]}};
+  },
+  answer:async () => assert.fail('new appointment should use one model call')
+ };
+ const payload = {actor:'1', chatId:'-10', text:'5월 12일 16시 40분 가상인물A 피부과 방문 추가'};
+ await store.ingest(200,payload);
+ assert.match(await processJob(await store.claim(),store,ai,now), /가상인물A 피부과 방문/);
+ assert.equal(await store.ingest(200,payload),false);
+ assert.equal(await store.claim(),null);
+ const registered = (await store.tasks()).filter(({title}) => title === task.title);
+ assert.deepEqual(registered.map(({dueDate,time}) => [dueDate,time]), [['2025-05-12','16:40']]);
+ assert.equal(calls,1);
+});
+
+test('LangGraph resumes a persisted clarification once and keeps the original request date', async () => {
+ const store = await fixture();
+ const now = new Date();
+ now.setUTCHours(14,50,0,0);
+ if (+now < Date.now()) now.setUTCDate(now.getUTCDate() + 1);
+ const tomorrow = new Date(+now + 86400000).toISOString().slice(0,10);
+ const task = {
+  title:'가상인물A 피부과 방문', kind:'appointment', status:'open', dueDate:tomorrow, time:'16:40',
+  endDate:null, timeNote:null, person:'가상인물A', assignee:null, notes:null, followUpDate:null,
+  actualDeadline:null, remindAt:[]
+ };
+ const payload = {actor:'1', chatId:'-10', text:'내일 가상인물A 피부과 방문 추가'};
+ const ai = {classify:async () => ({intent:'create', targets:[], answer:{actions:[], reply:'',
+  clarification:{operation:'create', candidateIds:[], proposedChanges:[{field:'dueDate',value:task.dueDate}],
+   question:'몇 시인가요?', unresolved:'시각'}
+ }})};
+ await store.ingest(210,payload);
+ assert.match(await processJob(await store.claim(),store,ai,now), /몇 시인가요/);
+ const state = await store.conversation('1');
+ const delivery = await store.claimDelivery();
+ const {workflowToken} = await store.referencesForDelivery(delivery);
+ assert.equal(workflowToken,state.workflow.token);
+ await store.deliveryResult(delivery,'sent',{
+  messageIds:[210], messageRefs:[[]], chatId:'-10', replyPending:true, replyOwner:'1',
+  requestId:state.requestId, workflowToken
+ });
+ const restored = new Store(pool,store.familyId);
+ const duringWait = {actor:'2', chatId:'-10', text:'오늘 일정 알려줘'};
+ await restored.ingest(211,duringWait);
+ await processJob(await restored.claim(),restored,null,now);
+ assert.equal((await restored.conversation('1')).workflow.token,workflowToken);
+ let answerCalls = 0;
+ const followupAi = {
+  classify:async () => assert.fail('resuming should use the prior intent'),
+  answer:async ({message,pendingRequest}) => {
+   answerCalls++;
+   assert.equal(message.text,'16:40');
+   assert.equal(pendingRequest.startedAt,now.toISOString());
+   assert.equal(pendingRequest.proposedChanges[0].value,task.dueDate);
+   return {actions:[{operation:'create', id:null, expectedVersion:null, task}], reply:''};
+  }
+ };
+ const response = {...payload, text:'16:40', replyTo:JSON.stringify({id:210})};
+ const nextDay = new Date(+now + 20 * 60000);
+ await restored.ingest(212,response);
+ assert.match(await processJob(await restored.claim(),restored,followupAi,nextDay), /가상인물A 피부과 방문/);
+ await restored.ingest(213,response);
+ assert.match(await processJob(await restored.claim(),restored,followupAi,nextDay), /이미 처리/);
+ assert.equal(answerCalls,1);
+ assert.equal((await restored.tasks()).length,1);
+ assert.equal((await restored.conversation('1')).pending,false);
+});

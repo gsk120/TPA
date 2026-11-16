@@ -104,6 +104,14 @@ export class Store {
     return this.tx(async c => {
       const r = await c.query("select id from assistant.jobs where family_id=$1 and id=$2 and lease=$3 and status='running' and lease_until>now() for update", [this.familyId, job.id, job.lease]);
       if (!r.rowCount) throw new Error('작업 실행 권한이 만료됐습니다.');
+      if (memory?.resumeToken) {
+        const {rows} = await c.query('select value from assistant.runtime where family_id=$1 and key=$2 for update',
+          [this.familyId, 'conversation:' + String(job.payload.actor)]);
+        const state = rows[0]?.value;
+        if (!state?.pending || state.workflow?.token !== memory.resumeToken) {
+          throw new Error('확인 요청이 이미 처리됐거나 다른 요청으로 바뀌었어요.');
+        }
+      }
       if (memory?.weeklyConfirmation) {
         const {rows} = await c.query('select value from assistant.runtime where family_id=$1 and key=$2 for update',
           [this.familyId, 'conversation:' + String(job.payload.actor)]);
@@ -161,7 +169,7 @@ export class Store {
           await c.query('insert into assistant.runtime(family_id,key,value) values($1,$2,$3)',
             [this.familyId, 'button:' + memory.button.token, memory.button.action]);
         }
-        await c.query('update assistant.deliveries set result=$3 where family_id=$1 and id=$2',[this.familyId,'reply:'+job.id,{context:{refs:memory.refs||[],ownerActor:String(job.payload.actor),pending:memory.conversation?.pending||false,requestId:memory.conversation?.requestId||null,expiresAt:memory.expiresAt,replyMarkup:memory.button?.markup}}]);
+        await c.query('update assistant.deliveries set result=$3 where family_id=$1 and id=$2',[this.familyId,'reply:'+job.id,{context:{refs:memory.refs||[],ownerActor:String(job.payload.actor),pending:memory.conversation?.pending||false,requestId:memory.conversation?.requestId||null,workflowToken:memory.conversation?.workflow?.token,expiresAt:memory.expiresAt,replyMarkup:memory.button?.markup}}]);
         if(memory.conversation)await c.query('insert into assistant.runtime(family_id,key,value) values($1,$2,$3) on conflict(family_id,key) do update set value=excluded.value',[this.familyId,'conversation:'+String(job.payload.actor),memory.conversation]);
       }
       await c.query("update assistant.jobs set status='done',finished_at=now() where family_id=$1 and id=$2", [this.familyId, job.id]);
@@ -221,7 +229,7 @@ export class Store {
       if(!changed.rowCount)return;
       if(status==='sent' && result.messageRefs){
         for(let i=0;i<result.messageIds.length;i++){
-          const value={messageId:Number(result.messageIds[i]),chatId:String(result.chatId),ownerActor:result.replyOwner||null,pending:result.replyPending||false,requestId:result.requestId||null,taskIds:result.messageRefs[i]||[],expiresAt:new Date(Date.now()+30*86400000).toISOString()};
+          const value={messageId:Number(result.messageIds[i]),chatId:String(result.chatId),ownerActor:result.replyOwner||null,pending:result.replyPending||false,requestId:result.requestId||null,workflowToken:result.workflowToken,taskIds:result.messageRefs[i]||[],expiresAt:new Date(Date.now()+30*86400000).toISOString()};
           await c.query('insert into assistant.runtime(family_id,key,value) values($1,$2,$3) on conflict(family_id,key) do update set value=excluded.value',[this.familyId,'message:'+(Number(result.messageIds[i])%1000),value]);
         }
       }

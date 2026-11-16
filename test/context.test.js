@@ -4,7 +4,7 @@ import {quickCommand,selectContext,nextConversation,messageReferences} from '../
 import {processJob,help,supportedCommands} from '../src/processor.js';
 const now=new Date('2026-11-02T00:00:00Z');
 const t=(id,title,extra={})=>({id,title,version:1,kind:'task',status:'open',dueDate:'2026-11-03',time:null,endDate:null,timeNote:null,person:null,assignee:null,notes:'keep',followUpDate:null,actualDeadline:null,remindAt:[],...extra});
-const a=t('11111111-1111-4111-8111-111111111111','서아 불소도포'),b=t('22222222-2222-4222-8222-222222222222','기석 치과'),old=t('33333333-3333-4333-8333-333333333333','자동차보험 연장',{status:'done',dueDate:'2020-01-01'});
+const a=t('11111111-1111-4111-8111-111111111111','가상인물A 불소도포'),b=t('22222222-2222-4222-8222-222222222222','가상인물C 치과'),old=t('33333333-3333-4333-8333-333333333333','자동차보험 연장',{status:'done',dueDate:'2020-01-01'});
 const message=(text,extra={})=>({actor:'1',chatId:'-10',text,...extra});
 const select=(text,state=null,ref=null,extra={})=>selectContext([a,b,old],message(text,extra),state,ref,now);
 function store(tasks=[a,b,old]){return {tasks:async()=>tasks,finish:async()=>{},conversation:async()=>null,relatedHistory:async()=>({events:[],total:0,truncated:false})};}
@@ -15,10 +15,38 @@ test('exact read shortcuts bypass AI while mixed requests never become reads',as
  for(const cmd of supportedCommands)assert.ok(help.includes('/'+cmd));assert.ok(!help.includes('/commands'));
 });
 test('targeted extraction excludes unrelated and includes old completed records',()=>{
- assert.deepEqual(select('서아 불소도포 내일로 변경해줘').candidates.map(t=>t.id),[a.id]);assert.deepEqual(select('자동차보험 언제 연장했지?').candidates.map(t=>t.id),[old.id]);
+ assert.deepEqual(select('가상인물A 불소도포 내일로 변경해줘').candidates.map(t=>t.id),[a.id]);assert.deepEqual(select('자동차보험 언제 연장했지?').candidates.map(t=>t.id),[old.id]);
+});
+
+test('LangGraph uses classified update targets and classified retrieval bypasses candidate limits', async () => {
+ const clinic = t(a.id,'가상인물A 피부과');
+ const other = Array.from({length:13},(_,i) => t(String(i),i % 2 ? '가상인물A 운동회' : '가상인물B 피부과'));
+ const fixture = store([clinic,...other]);
+ let persisted, lookupCalls = 0;
+ fixture.finish = async (_job,changes,reply) => {persisted = {changes,reply};};
+ await processJob({payload:message('가상인물A 피부과 방문 일정에 메모 추가해줘')},fixture,{
+  classify:async () => ({intent:'update', targets:['가상인물A 피부과'], answer:null}),
+  answer:async ({tasks}) => {
+   lookupCalls++;
+   assert.deepEqual(tasks.map(t => t.id),[clinic.id]);
+   return {reply:'', actions:[{operation:'update', id:clinic.id, expectedVersion:1, task:{...clinic,notes:'가상 접수 메모'}}]};
+  }
+ },now);
+ assert.equal(persisted.changes.length,1);
+ assert.equal(persisted.changes[0].after.notes,'가상 접수 메모');
+ await processJob({payload:message('이번 달 피부과 일정을 보여줘')},fixture,{
+  classify:async () => ({intent:'retrieve', targets:[], answer:{reply:'', actions:[], retrieval:{
+   kind:'task_list', status:'active', from:'2026-11-01', to:'2026-11-30', person:null, search:'피부과'
+  }}}),
+  answer:async () => assert.fail('list retrieval should use one model call')
+ },now);
+ assert.match(persisted.reply,/가상인물A 피부과/);
+ assert.doesNotMatch(persisted.reply,/가상인물A 운동회/);
+ assert.equal(persisted.changes.length,0);
+ assert.equal(lookupCalls,1);
 });
 test('same actor context persists but cross-user and expired context cannot resolve pronouns',()=>{
- const state=nextConversation('1','서아 불소도포','언제로 변경할까요?',[a.id],null,now);
+ const state=nextConversation('1','가상인물A 불소도포','언제로 변경할까요?',[a.id],null,now);
  assert.deepEqual(select('그거 내일로',state).candidates.map(t=>t.id),[a.id]);assert.ok(select('그거 내일로',state,null,{actor:'2'}).blocked);assert.ok(select('그거 내일로',{...state,expiresAt:'2026-01-01T00:00:00Z'}).blocked);
 });
 test('reply mapping uses current task, rejects wrong group and ambiguous list replies',()=>{
@@ -29,35 +57,35 @@ test('reply mapping uses current task, rejects wrong group and ambiguous list re
  assert.ok(select('완료했어',null,null,{replyTo:'{}'}).blocked);
 });
 test('new task clarification can continue without an existing task, only for same user',()=>{
- const state=nextConversation('1','서빈 병원 금요일 추가','몇 시인가요?',[],null,now);
+ const state=nextConversation('1','가상인물B 병원 금요일 추가','몇 시인가요?',[],null,now);
  assert.equal(select('오전 11시',state).blocked,null);assert.equal(select('오전 11시',state).context.length,2);
  assert.ok(select('오전 11시',state,null,{actor:'2'}).blocked);
  const ref={chatId:'-10',taskIds:[],ownerActor:'1',pending:true,expiresAt:'2026-12-01T00:00:00Z'};assert.equal(select('오전 11시',state,ref,{replyTo:'{}'}).blocked,null);
 });
 test('candidate and input limits request clarification rather than silently truncate',()=>{
  const many=Array.from({length:20},(_,i)=>t(String(i),'보험 '+i));const s=selectContext(many,message('보험 변경해줘'),null,null,now);assert.ok(s.blocked);assert.equal(s.coverage.truncated,true);
- assert.ok(selectContext([t(a.id,a.title,{notes:'x'.repeat(19000)})],message('서아 불소도포'),null,null,now).blocked);
+ assert.ok(selectContext([t(a.id,a.title,{notes:'x'.repeat(19000)})],message('가상인물A 불소도포'),null,null,now).blocked);
 });
 test('split message references only contain titles actually present in each part',()=>{
- assert.deepEqual(messageReferences(['서아 불소도포','기석 치과','접수했어요'],[a,b]),[[a.id],[b.id],[]]);
+ assert.deepEqual(messageReferences(['가상인물A 불소도포','가상인물C 치과','접수했어요'],[a,b]),[[a.id],[b.id],[]]);
 });
 test('AI receives selected full fields and summary history, cannot edit unseen task',async()=>{
  let input,finished;const s=store();s.finish=async(...args)=>{finished=args;};s.relatedHistory=async()=>({events:[{actor:'1',at:now.toISOString(),before:{...a,notes:'HUGE'},after:a}],total:50,truncated:true});
  const ai={answer:async i=>{input=i;return {reply:'어느 날로 바꿀까요?',actions:[]};}};
- await processJob({payload:message('서아 불소도포 변경해줘')},s,ai,now);
+ await processJob({payload:message('가상인물A 불소도포 변경해줘')},s,ai,now);
  assert.deepEqual(input.tasks.map(t=>t.id),[a.id]);assert.equal(input.tasks[0].notes,'keep');assert.equal(input.history[0].before.notes,undefined);assert.equal(input.coverage.historyTruncated,true);assert.equal(input.coverage.familyTaskCount,3);assert.ok(finished[4].conversation);
  const bad={answer:async()=>({reply:'',actions:[{operation:'update',id:b.id,expectedVersion:1,task:{...b,status:'done'},reason:'wrong'}]})};
- await assert.rejects(processJob({payload:message('서아 불소도포 변경해줘')},s,bad,now),/후보 범위/);
+ await assert.rejects(processJob({payload:message('가상인물A 불소도포 변경해줘')},s,bad,now),/후보 범위/);
 });
 
 test('read-only questions cannot mutate and missing edit targets cannot become new tasks',async()=>{
  const create={operation:'create',id:null,expectedVersion:null,task:a,reason:'wrong'};
- await assert.rejects(processJob({payload:message('서아 불소도포 언제야 알려줘')},store(),{answer:async()=>({reply:'',actions:[create]})},now),/조회 요청/);
+ await assert.rejects(processJob({payload:message('가상인물A 불소도포 언제야 알려줘')},store(),{answer:async()=>({reply:'',actions:[create]})},now),/조회 요청/);
  await assert.rejects(processJob({payload:message('없는일정 내일로 변경해줘')},store(),{answer:async()=>({reply:'',actions:[create]})},now),/신규 추가/);
 });
 
 test('reply to a task clarification without repeating title retains same-user candidate',()=>{
- const state=nextConversation('1','서아 불소도포 변경해줘','언제로 바꿀까요?',[a.id],null,now);
+ const state=nextConversation('1','가상인물A 불소도포 변경해줘','언제로 바꿀까요?',[a.id],null,now);
  const ref={chatId:'-10',taskIds:[],ownerActor:'1',pending:true,expiresAt:'2026-12-01T00:00:00Z'};
  const result=select('내일로',state,ref,{replyTo:'{}'});assert.equal(result.blocked,null);assert.deepEqual(result.candidates.map(t=>t.id),[a.id]);
 });

@@ -20,6 +20,30 @@ export const schema = {
     } }
   }
 };
+
+export const intentSchema = {
+  type: 'object', additionalProperties: false,
+  required: ['intent', 'targets', 'answer'],
+  properties: {
+    intent: {type:'string', enum:['create','update','complete','cancel','retrieve','detail','history','settings','mixed','unknown']},
+    targets: {type:'array', items:{type:'string'}},
+    answer: {anyOf:[{type:'null'}, schema]}
+  }
+};
+
+export function validateIntent(value) {
+  if (!value || !intentSchema.properties.intent.enum.includes(value.intent)
+      || !Array.isArray(value.targets) || value.targets.length > 20
+      || value.targets.some(t => typeof t !== 'string' || !t.trim() || t.length > 400)) {
+    throw new Error('AI가 요청 종류를 확인하지 못했어요. 원하는 작업을 다시 말씀해주세요.');
+  }
+  const resolvesDirectly = ['create','retrieve','settings','unknown'].includes(value.intent);
+  if (resolvesDirectly !== !!value.answer) {
+    throw new Error('AI가 요청에 필요한 정보를 확인하지 못했어요. 요청을 다시 말씀해주세요.');
+  }
+  if (value.answer) parseAnswer(JSON.stringify(value.answer));
+  return value;
+}
 export function parseAnswer(text) {
   const value = JSON.parse(text);
   if (!value || typeof value.reply !== 'string' || value.reply.length > 20000 || !Array.isArray(value.actions)) throw new Error('AI 응답 형식을 확인하지 못했어요.');
