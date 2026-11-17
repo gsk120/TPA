@@ -1,4 +1,11 @@
 export const TIME_ZONE = 'Asia/Seoul';
+export const timeTypes = ['all_day','timed','unknown','range','condition','date_only'];
+export const validClock = value => typeof value === 'string' && /^(?:[01]\d|2[0-3]):[0-5]\d$/u.test(value);
+export function validTimeZone(value) {
+ if (typeof value !== 'string' || !value) return false;
+ try { new Intl.DateTimeFormat('en',{timeZone:value}); return true; }
+ catch { return false; }
+}
 export function kst(now = new Date(), timeZone = TIME_ZONE) {
   return new Intl.DateTimeFormat('sv-SE', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).format(now).replace(' ', 'T');
 }

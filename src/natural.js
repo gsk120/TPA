@@ -3,8 +3,9 @@ import { historyRequest } from './history-search.js';
 import { isActive, planChanges } from './tasks.js';
 import { addDays, today } from './time.js';
 import { settingsText, validateSettings } from './settings.js';
-import { nextConversation, selectContext, searchTerms, settingsIntent, summarizeHistory, validateClarification } from './context.js';
+import { matchTarget, nextConversation, selectContext, searchTerms, settingsIntent, summarizeHistory, validateClarification } from './context.js';
 import { buttonFor } from './buttons.js';
+import { missingSeriesFields, planSeriesRegistration, readSeriesDraft } from './weekly.js';
 
 // A request with separately stated completion clauses must cover each clause.
 function completionScopes(text, tasks) {
@@ -74,16 +75,47 @@ export async function planWithoutTarget({job, ai, signal, now, options, current,
   classification, previous, resumedIntent}) {
   const intent = classification?.intent ?? resumedIntent;
   const answer = classification?.answer ?? await ai.answer({
-    message:job.payload, now, settings:current, tasks:[], history:[], context:previous.turns,
-    pendingRequest:previous.request, intent
+    message:job.payload, now, settings:current, tasks:[], history:[], context:previous?.turns ?? [],
+    pendingRequest:resumedIntent ? previous?.request : null, intent
   }, signal);
   verifyIntent(intent, answer);
-  const clarification = validateClarification(answer.clarification, []);
+  let clarification = validateClarification(answer.clarification, []);
+  const previousDraft = resumedIntent === 'create' ? previous?.request.seriesDraft : null;
+  const rawDraft = answer.series ?? previousDraft;
+  const draft = rawDraft == null ? null : readSeriesDraft(rawDraft);
+  if (draft && (answer.actions.length || answer.settings || answer.retrieval)) {
+    throw new Error('반복 일정과 개별 일정 변경이 함께 반환되어 저장을 보류했어요.');
+  }
   if (clarification && (answer.actions.length || answer.settings || answer.retrieval)) {
     throw new Error('AI 응답에 확인 질문과 실행 요청이 섞였어요. 다시 말씀해주세요.');
   }
+  if (draft) {
+    const sentAt = Number.isSafeInteger(job.payload.sentAt) ? new Date(job.payload.sentAt * 1000) : now;
+    const requestedAt = resumedIntent ? new Date(previous.request.startedAt) : sentAt;
+    const timeZone = resumedIntent ? previous.request.timeZone : current.timeZone;
+    const missing = missingSeriesFields(draft);
+    if (!clarification && (missing.length || answer.series == null)) {
+      clarification = {operation:'create',candidateIds:[],proposedChanges:[],
+        question:missing.length ? '반복 등록할 일정의 ' + missing.join(', ') + '을 알려주세요.'
+          : '반복 일정에 적용할 내용을 다시 알려주세요.',unresolved:missing.join(', ')};
+    }
+    const plan = clarification ? {reply:'❓ 확인이 필요해요\n\n' + clarification.question}
+      : planSeriesRegistration(draft,requestedAt,timeZone,job.payload.actor);
+    const conversation = nextConversation(job.payload.actor,originalText,plan.reply,[],
+      resumedIntent ? previous : null,now,{continuation:!!resumedIntent,timeZone,clarification});
+    conversation.request.startedAt = requestedAt.toISOString();
+    if (clarification) {
+      conversation.request.operation = 'create';
+      conversation.request.seriesDraft = draft;
+    } else {
+      conversation.pending = false;
+      conversation.request.question = null;
+      delete conversation.request.seriesDraft;
+    }
+    return {...plan,conversation};
+  }
   const changes = planChanges(answer.actions, [], now);
-  const retrieval = answer.retrieval ? retrieveTasks(await loadTasks(), answer.retrieval, now, current.timeZone) : null;
+  const retrieval = answer.retrieval ? retrieveTasks(await loadTasks(answer.retrieval), answer.retrieval, now, current.timeZone) : null;
   const refs = retrieval?.tasks ?? [];
   const settingsChange = answer.settings ? {
     before:current, after:validateSettings(answer.settings), version:options.settingsVersion || 1
@@ -98,14 +130,69 @@ export async function planWithoutTarget({job, ai, signal, now, options, current,
   return {reply, changes, refs, settingsChange, conversation};
 }
 
-export async function planNatural({job, store, ai, now, signal, options, current, tasks, originalText,
+async function planSeriesCancellation({job, store, now, current, originalText, previous, classification}) {
+  const pending = previous?.request.seriesCancellation;
+  const cancellation = classification?.intent === 'cancel' ? classification.cancellation : null;
+  const targets = classification?.intent === 'cancel' && classification.targets.length
+    ? classification.targets : pending?.targets ?? [];
+  const series = targets.length === 1 ? matchTarget(await store.activeScheduleSeries(), targets[0]) : [];
+  const candidates = cancellation?.date ? series.filter(item => item.start.startsWith(cancellation.date)) : series;
+  const versions = Object.keys(pending?.versions ?? {}).length ? pending.versions
+    : Object.fromEntries(series.map(({id, version}) => [id, version]));
+  if (cancellation?.scope === 'series' && candidates.length === 1) {
+    const [{id, version, title}] = candidates;
+    if (Object.keys(versions).length && versions[id] !== version) {
+      throw new Error('확인하는 동안 반복 일정이 바뀌었어요. 현재 일정으로 다시 요청해주세요.');
+    }
+    const reply = '✅ 반복일정 전체 취소 완료\n\n' + title;
+    const conversation = nextConversation(job.payload.actor, originalText, reply, [], previous, now,
+      {continuation:!!pending,timeZone:current.timeZone});
+    conversation.pending = false;
+    conversation.request.question = null;
+    delete conversation.request.seriesCancellation;
+    return {reply, conversation, seriesCancellation:{id, version}};
+  }
+  const question = cancellation?.question ?? (!cancellation ? previous?.request.question : null)
+    ?? (candidates.length > 1 ? '어느 반복일정 전체를 취소할까요? 시작 날짜와 제목을 알려주세요.'
+      : '취소할 반복일정 하나의 제목과 시작 날짜를 알려주세요.');
+  const list = candidates.length > 1 && !cancellation?.question
+    ? '\n\n' + candidates.slice(0, 10).map(item => '• ' + item.title + ' · 시작 ' + item.start.replace('T', ' ').slice(0,16)).join('\n')
+    : '';
+  const reply = !cancellation && previous?.request.question ? question : '❓ 확인이 필요해요\n\n' + question + list;
+  const conversation = nextConversation(job.payload.actor, originalText, reply, [], previous, now,
+    {continuation:!!pending,timeZone:current.timeZone,clarification:{operation:'cancel'}});
+  conversation.request.seriesCancellation = {targets, versions};
+  return {reply, conversation};
+}
+
+export async function planNatural({job, store, ai, now, signal, options, current, tasks, loadTasks, originalText,
   previous, reference, buttonInput, classification, resumedIntent, resumed}) {
   let reply, changes = [], settingsChange = null, refs = [], conversation = null, retrievalReply = null, button = null;
+  const pendingSeries = resumed && previous.request.seriesCancellation;
+  const cancellation = classification?.intent === 'cancel' ? classification.cancellation : null;
+  const occurrence = cancellation?.scope === 'occurrence' ? cancellation : null;
+  if (!occurrence && (cancellation || pendingSeries)) {
+    return planSeriesCancellation({job,store,now,current,originalText,previous:pendingSeries ? previous : null,classification});
+  }
   const intent = classification?.intent ?? resumedIntent;
+  const cancelOccurrence = !!occurrence || (resumed && previous.request.cancelOccurrence);
+  if (occurrence?.date) {
+    const datedTasks = await loadTasks({from:occurrence.date,to:occurrence.date});
+    tasks = [...new Map([...tasks,...datedTasks].map(task => [task.id,task])).values()];
+  }
   const existingTarget = ['update','complete','cancel','mixed'].includes(intent);
   const completion = resumed ? false : intent && intent !== 'existing'
     ? intent === 'complete' : isCompletionRequest(originalText);
-  const activeTasks = completion ? tasks.filter(isActive) : tasks;
+  let activeTasks = completion ? tasks.filter(isActive) : tasks;
+  if (occurrence) {
+    const request = pendingSeries ? previous.request : null;
+    const targetText = classification.targets.reduce((text, title) => text.replace(title, ' '), originalText);
+    const hint = targetHints(targetText, request ? new Date(request.startedAt) : now, request?.timeZone ?? current.timeZone);
+    const versions = pendingSeries && Object.keys(pendingSeries.versions).length ? pendingSeries.versions : null;
+    activeTasks = tasks.filter(t => t.recurrence && t.status !== 'cancelled'
+      && (!versions || versions[t.recurrence.seriesId] === t.recurrence.seriesVersion)
+      && (!occurrence.date || t.dueDate === occurrence.date) && (!hint || hint(t)));
+  }
   const hasIndependentIntent = classification && !resumed && !['unknown','mixed'].includes(intent);
   const freshState = hasIndependentIntent ? null : previous;
   const selection = buttonInput ? {
@@ -113,8 +200,14 @@ export async function planNatural({job, store, ai, now, signal, options, current
     continuation:true, coverage:{scope:'button', providedTaskCount:1}
   } : classification?.intent === 'history'
     ? {candidates:[], context:[], continuation:false, request:null, coverage:{scope:'history', familyTaskCount:tasks.length, providedTaskCount:0}}
-    : selectContext(activeTasks,job.payload,freshState,reference,now,current.timeZone,classification?.targets);
-  if (resumed && !buttonInput && !selection.continuation) {
+    : selectContext(activeTasks,pendingSeries ? {...job.payload,replyTo:null} : job.payload,
+      pendingSeries ? null : freshState,reference,now,current.timeZone,
+      occurrence && !classification.targets.length && pendingSeries ? pendingSeries.targets : classification?.targets);
+  if (pendingSeries) {
+    selection.continuation = true;
+    selection.request = previous.request;
+    selection.context = previous.turns || [];
+  } else if (resumed && !buttonInput && !selection.continuation) {
     Object.assign(selection, {
       candidates: tasks.filter(t => previous.taskIds.includes(t.id)),
       continuation:true, request:previous.request, blocked:null,
@@ -122,7 +215,7 @@ export async function planNatural({job, store, ai, now, signal, options, current
     });
   }
   if (selection.request?.operation === 'weekly') {
-    const reply = selection.request.question;
+    const reply = '이전 반복 일정 요청을 새 등록 방식으로 처리하려면 원래 요청과 답변을 함께 다시 보내주세요.';
     return {reply};
   }
   const awaitingTarget = previous?.pending && previous.actor === String(job.payload.actor)
@@ -131,7 +224,7 @@ export async function planNatural({job, store, ai, now, signal, options, current
       && reference.ownerActor === String(job.payload.actor) && reference.chatId === String(job.payload.chatId)));
   const dateReply = !buttonInput && awaitingTarget
     && /^(?:(?:오늘|내일|모레)|(?:\d{4}-\d{2}-\d{2})|(?:\d{1,2}\/\d{1,2})|(?:(?:\d{4}\s*년\s*)?\d{1,2}\s*월\s*\d{1,2}\s*일)|(?:(?:오전|오후)\s*)?\d{1,2}(?::\d{2}|\s*시(?:\s*(?:반|\d{1,2}\s*분))?))(?:\s*(?:거|것|건|일정))?(?:이요|요)?[.!\s]*$/u.test(originalText);
-  const exactScope = (!intent || intent === 'existing' || existingTarget) && !resumed && !buttonInput && !job.payload.replyTo && !dateReply
+  const exactScope = !occurrence && (!intent || intent === 'existing' || existingTarget) && !resumed && !buttonInput && !job.payload.replyTo && !dateReply
     ? duplicateTargets(originalText, activeTasks, completion, now, current.timeZone) : null;
   if (dateReply) {
     const filter = targetHints(originalText, now, current.timeZone);
@@ -167,7 +260,7 @@ export async function planNatural({job, store, ai, now, signal, options, current
   const directCompletion = requestedTitle && refs.length === 1 && isActive(refs[0])
     && refs[0].title.normalize('NFKC') === requestedTitle.normalize('NFKC');
   let chooseByDate = false;
-  if ((exactScope && !exactScope.all && refs.length > 1) || (dateReply && refs.length !== 1)) {
+  if (((occurrence && !selection.blocked || (exactScope && !exactScope.all)) && refs.length > 1) || (dateReply && refs.length !== 1)) {
     if (dateReply && !refs.length) {
       refs = tasks.filter(t => previous.taskIds.includes(t.id) && (!completing || isActive(t)));
       reply = '❓ 그 날짜나 시각에 해당하는 일정을 찾지 못했어요. 원래 일정의 날짜나 시각을 다시 알려주세요.';
@@ -179,7 +272,7 @@ export async function planNatural({job, store, ai, now, signal, options, current
       reply = `❓ 후보가 ${refs.length}건 있어요. 원래 일정의 날짜나 시각을 알려주세요.`;
     }
     chooseByDate = true;
-  } else if (exactScope && !refs.length && !selection.blocked) {
+  } else if ((occurrence || exactScope) && !refs.length && !selection.blocked) {
     reply = '❓ 지정한 날짜나 시각에 해당하는 일정을 찾지 못했어요.';
   } else if (exactScope?.all && refs.length > 20) {
     reply = '한 번에 최대 20건을 변경할 수 있어요. 기간을 좁혀 알려주세요.';
@@ -205,7 +298,7 @@ export async function planNatural({job, store, ai, now, signal, options, current
       input.settings = {...current, timeZone:selection.request.timeZone};
       input.selectedTaskId = refs[0].id;
     }
-    if (exactScope && !exactScope.all && refs.length === 1) input.selectedTaskId = refs[0].id;
+    if ((occurrence || (exactScope && !exactScope.all)) && refs.length === 1) input.selectedTaskId = refs[0].id;
     if (buttonInput) {
       input.now = new Date(buttonInput.action.request.startedAt);
       input.settings = {...current, timeZone:buttonInput.action.request.timeZone};
@@ -217,9 +310,13 @@ export async function planNatural({job, store, ai, now, signal, options, current
       const answer=await ai.answer(input,signal);
       if(!Array.isArray(answer.actions))throw new Error('AI 응답 형식을 확인하지 못했어요.');
       verifyIntent(intent, answer);
+      if (cancelOccurrence && (answer.actions.length > 1 || answer.actions.some(a =>
+        a.operation !== 'update' || a.task?.status !== 'cancelled' || !tasks.find(t => t.id === a.id)?.recurrence))) {
+        throw new Error('선택한 반복 회차 한 건의 취소를 확인하지 못했어요.');
+      }
       if(answer.retrieval){
         if(answer.clarification)throw new Error('조회 범위와 확인 질문이 충돌해요. 저장하지 않았습니다.');
-        const result=retrieveTasks(tasks,answer.retrieval,now,current.timeZone);
+        const result=retrieveTasks(loadTasks ? await loadTasks(answer.retrieval) : tasks,answer.retrieval,now,current.timeZone);
         refs=result.tasks;retrievalReply=result.reply;
       }
       clarification=validateClarification(answer.clarification,selectedIds);
@@ -262,13 +359,14 @@ export async function planNatural({job, store, ai, now, signal, options, current
         const reply = '❓ 요청한 일정 중 일부를 확인하지 못했어요. 변경할 일정 제목을 각각 알려주세요.';
         return {reply, conversation:nextConversation(job.payload.actor, originalText, '', [], null, now)};
       }
-      if (resumed && answer.actions.some(a => a.operation === 'update'
+      if (resumed && !pendingSeries && answer.actions.some(a => a.operation === 'update'
           && previous.workflow.versions?.[a.id] !== a.expectedVersion)) {
         throw new Error('확인하는 동안 일정이 바뀌었어요. 현재 일정으로 다시 요청해주세요.');
       }
       changes=planChanges(answer.actions,tasks,now);
       if(answer.retrieval&&changes.length){
-        const projected=new Map(tasks.map(t=>[t.id,t]));for(const c of changes)projected.set(c.after.id,c.after);
+        const base=loadTasks ? await loadTasks(answer.retrieval) : tasks;
+        const projected=new Map(base.map(t=>[t.id,t]));for(const c of changes)projected.set(c.after.id,c.after);
         const result=retrieveTasks([...projected.values()],answer.retrieval,now,current.timeZone);refs=result.tasks;retrievalReply=result.reply;
       }
       if(clarification?.operation === 'update' && clarification.candidateIds.length > 3) {
@@ -280,6 +378,10 @@ export async function planNatural({job, store, ai, now, signal, options, current
     }
   }
   conversation=nextConversation(job.payload.actor,originalText,reply||'',changes.length?changes.map(c=>c.after.id):refs.map(t=>t.id),selection.continuation?previous:null,now,{continuation:selection.continuation,timeZone:current.timeZone,clarification});
+  if (cancelOccurrence) {
+    delete conversation.request.seriesCancellation;
+    conversation.request.cancelOccurrence = true;
+  }
   if (chooseByDate) conversation.request.chooseByDate = true;
   if (conversation.pending && intent && intent !== 'existing' && conversation.request.operation === 'unknown') {
     conversation.request.operation = intent;
@@ -299,7 +401,8 @@ export async function planNatural({job, store, ai, now, signal, options, current
   return {reply, changes, settingsChange, refs, conversation, retrievalReply, button};
 }
 
-function verifyIntent(intent, {actions, retrieval, settings}) {
+function verifyIntent(intent, {actions, retrieval, settings, series}) {
+  if (series != null && intent !== 'create') throw new Error('반복 일정 신규 등록 의도를 확인하지 못했어요.');
   if (!intent || ['existing','mixed'].includes(intent)) return;
   const expectedOperation = intent === 'create' ? 'create'
     : ['update','complete','cancel'].includes(intent) ? 'update' : null;

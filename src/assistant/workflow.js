@@ -52,7 +52,14 @@ export async function runNaturalWorkflow({ai, input, signal, planWithoutTarget, 
     graph.addNode(node, async ({intent}) => {
       const withoutTarget = ['create','retrieve','settings','unknown'].includes(intent);
       const plan = withoutTarget ? planWithoutTarget : planWithContext;
-      result = await plan(classification, pending ? intent : null);
+      const request = pending ? previous.request : null;
+      const turnClassification = request?.seriesCancellation
+        ? validateIntent(await ai.classify({
+          ...input, now:new Date(request.startedAt),
+          settings:{...input.settings,timeZone:request.timeZone}, pendingRequest:request
+        }, signal))
+        : classification;
+      result = await plan(turnClassification, pending ? intent : null);
       return {question:result.conversation?.pending ? result.conversation.request.question : null};
     });
     graph.addConditionalEdges(node, ({question}) => question ? 'confirm' : END, ['confirm', END]);

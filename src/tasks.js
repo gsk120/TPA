@@ -1,9 +1,10 @@
 import { randomUUID } from 'node:crypto';
-import { validDay, validInstant } from './time.js';
+import { timeTypes, validClock, validDay, validInstant, validTimeZone } from './time.js';
 
 export const kinds = ['task', 'decision', 'appointment', 'registration', 'event'];
 export const statuses = ['open', 'in_progress', 'waiting', 'done', 'cancelled'];
 const fields = ['title', 'kind', 'status', 'dueDate', 'time', 'endDate', 'timeNote', 'person', 'assignee', 'notes', 'followUpDate', 'actualDeadline', 'remindAt'];
+const timingFields = ['dueDate','time','endDate','timeNote','timeType','endTime','sourceTimeZone'];
 export const isActive = task => !['done', 'cancelled'].includes(task.status);
 export function validateTask(input, now = new Date()) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('과업 형식을 확인하세요.');
@@ -19,9 +20,24 @@ export function validateTask(input, now = new Date()) {
   }
   if (!task.title || !kinds.includes(task.kind) || !statuses.includes(task.status)) throw new Error('제목·종류·상태를 확인하세요.');
   for (const key of ['dueDate', 'endDate', 'followUpDate', 'actualDeadline']) if (task[key] !== null && !validDay(task[key])) throw new Error('날짜를 확인하세요: ' + key);
-  if (task.time !== null && !/^([01]\d|2[0-3]):[0-5]\d$/.test(task.time)) throw new Error('시각을 확인하세요.');
+  if (task.time !== null && !validClock(task.time)) throw new Error('시각을 확인하세요.');
   if (task.time && !task.dueDate) throw new Error('시각에는 날짜도 필요합니다.');
   if (task.endDate && (!task.dueDate || task.endDate < task.dueDate)) throw new Error('종료 날짜를 확인하세요.');
+  const {timeType=null,endTime=null,sourceTimeZone=null} = input;
+  if ((timeType !== null && !timeTypes.includes(timeType))
+      || (sourceTimeZone !== null && !validTimeZone(sourceTimeZone))
+      || (endTime !== null && (timeType !== 'range' || !validClock(endTime)))
+      || (timeType === 'range' && (!endTime || !task.time
+        || (task.endDate ?? task.dueDate) === task.dueDate && endTime <= task.time))
+      || (timeType === 'timed' && !task.time)
+      || (['all_day','unknown','condition','date_only'].includes(timeType) && task.time !== null)
+      || (['all_day','date_only'].includes(timeType) && !task.dueDate)
+      || (timeType === 'condition' && !task.timeNote)) throw new Error('일정의 시간 유형과 시각을 확인하세요.');
+  if (timeType !== null) {
+    task.timeType = timeType;
+    if (endTime !== null) task.endTime = endTime;
+  }
+  if (sourceTimeZone !== null) task.sourceTimeZone = sourceTimeZone;
   if (!isActive(task)) task.remindAt = [];
   if (task.remindAt.some(v => Date.parse(v) <= now.getTime())) throw new Error('이미 지난 시각을 새 알림으로 설정할 수 없습니다.');
   return task;
@@ -44,7 +60,14 @@ export function planChanges(actions, currentTasks, now = new Date()) {
     const previous = action.operation === 'update' ? map.get(action.id) : null;
     const proposed = { ...action.task };
     if (previous && Array.isArray(proposed.remindAt)) {
-      const timingChanged = ['dueDate','time','endDate','timeNote'].some(k=>proposed[k]!==previous[k]);
+      if (proposed.timeType == null && proposed.time === previous.time && proposed.timeNote === previous.timeNote) {
+        proposed.timeType = previous.timeType;
+      }
+      if (proposed.timeType === 'range' && previous.timeType === 'range') proposed.endTime ??= previous.endTime;
+      if (proposed.time === previous.time && proposed.dueDate === previous.dueDate) {
+        proposed.sourceTimeZone ??= previous.sourceTimeZone;
+      }
+      const timingChanged = timingFields.some(key => (proposed[key] ?? null) !== (previous[key] ?? null));
       if (timingChanged && JSON.stringify(proposed.remindAt) === JSON.stringify(previous.remindAt)) proposed.remindAt = [];
       else proposed.remindAt = proposed.remindAt.filter(v=>!(previous.remindAt.includes(v) && Date.parse(v)<=now.getTime()));
     }
@@ -58,6 +81,9 @@ export function planChanges(actions, currentTasks, now = new Date()) {
       if (!old || old.version !== action.expectedVersion || seen.has(action.id)) throw new Error('목록이 변경됐거나 대상을 찾지 못했습니다. 다시 요청해주세요.');
       seen.add(action.id);
       const next = { ...old, ...data, version: old.version + 1, completedAt: data.status === 'done' ? old.completedAt || now.toISOString() : null, updatedAt: now.toISOString() };
+      for (const key of ['timeType','endTime','sourceTimeZone']) {
+        if (!Object.hasOwn(data,key)) delete next[key];
+      }
       changes.push({ before: old, after: next, reason: action.reason || '' }); map.set(next.id, next);
     }
   }

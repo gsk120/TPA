@@ -91,7 +91,7 @@ async function main(stage){
    if(stopping)break;if(!f.active)continue;const store=families.store(f);
    try{await verifyBot(tg,bot,f.chat_id);}catch{continue;}
    const d=await store.claimDelivery();if(!d)continue;sent=true;
-   try{const memory=await store.referencesForDelivery(d);const linked=memory?.refs??(/^(daily:|weekly:|reminder:|missed:)/.test(d.id)?await store.tasks():[]);const parts=splitMessage(d.text);const ids=await tg.send(f.chat_id,d.text,memory?.replyMarkup);await store.deliveryResult(d,'sent',{messageIds:ids,chatId:f.chat_id,messageRefs:messageReferences(parts,linked),replyOwner:memory?.ownerActor,replyPending:memory?.pending,requestId:memory?.requestId,workflowToken:memory?.workflowToken});}
+   try{const memory=await store.referencesForDelivery(d);const linked=memory?.refs??(/^(daily:|weekly:|reminder:|series-reminder:|missed:)/.test(d.id)?await store.tasks():[]);const parts=splitMessage(d.text);const ids=await tg.send(f.chat_id,d.text,memory?.replyMarkup);await store.deliveryResult(d,'sent',{messageIds:ids,chatId:f.chat_id,messageRefs:messageReferences(parts,linked),replyOwner:memory?.ownerActor,replyPending:memory?.pending,requestId:memory?.requestId,workflowToken:memory?.workflowToken});}
    catch(e){const status=e.retryAfter&&d.attempts<3?'pending':e.uncertain||!e.message?.startsWith('텔레그램')?'uncertain':'failed';await store.deliveryResult(d,status,{reason:safeError(e)},Math.min(e.retryAfter||0,3600));}
    await pause(3100);
   }}catch{console.error('발송·DB 확인 실패.');await pause(10000);}if(!sent)await pause(1500);}};

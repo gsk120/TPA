@@ -1,6 +1,9 @@
 import pg from 'pg';
 import { readFile } from 'node:fs/promises';
 import { randomUUID, createHash } from 'node:crypto';
+import { applyOccurrenceChange, createScheduleSeries, hasScheduleSchema, linkScheduleOccurrence, readActiveScheduleSeries, readCalendarTasks, updateScheduleSeries } from './schedule-store.js';
+import { occurrenceId } from './recurrence.js';
+import { addScheduleBackup, restoreFamilyBackup } from './schedule-backup.js';
 
 export class Store {
   constructor(pool, familyId) { this.pool = pool; this.familyId = familyId; }
@@ -44,6 +47,27 @@ export class Store {
   }
   async close() { if (this.lock) { await this.lock.query('select pg_advisory_unlock_all()').catch(() => {}); this.lock.release(); } await this.pool.end(); }
   async tasks() { return (await this.pool.query('select data from assistant.tasks where family_id=$1 order by id', [this.familyId])).rows.map(r => r.data); }
+  async calendarTasks(options) {
+    if (!await hasScheduleSchema(this.pool)) return this.tasks();
+    return this.tx(async c => {
+      await c.query('set transaction isolation level repeatable read read only');
+      const {rows} = await c.query('select data from assistant.tasks where family_id=$1 order by id', [this.familyId]);
+      return readCalendarTasks(c,this.familyId,rows.map(row => row.data),options);
+    });
+  }
+  async createScheduleSeries(input, actor) {
+    return this.tx(c => createScheduleSeries(c,this.familyId,input,actor));
+  }
+  async activeScheduleSeries() {
+    if (!await hasScheduleSchema(this.pool)) return [];
+    return readActiveScheduleSeries(this.pool,this.familyId);
+  }
+  async updateScheduleSeries(id, expectedVersion, patch, actor) {
+    return this.tx(c => updateScheduleSeries(c,this.familyId,id,expectedVersion,patch,actor));
+  }
+  async linkScheduleOccurrence(input) {
+    return this.tx(c => linkScheduleOccurrence(c,this.familyId,input));
+  }
   async history(search = '') {
     return (await this.pool.query("select actor,task_id,before_data as before,after_data as after,reason,at from assistant.history where family_id=$1 and ($2='' or position(lower($2) in lower(coalesce(after_data->>'title','') || ' ' || reason || ' ' || to_char(at at time zone 'Asia/Seoul','YYYY-MM-DD')))>0) order by at desc limit 500", [this.familyId, search.slice(0,300)])).rows.map(r => ({ ...r, at: r.at.toISOString() }));
   }
@@ -112,31 +136,35 @@ export class Store {
           throw new Error('확인 요청이 이미 처리됐거나 다른 요청으로 바뀌었어요.');
         }
       }
-      if (memory?.weeklyConfirmation) {
-        const {rows} = await c.query('select value from assistant.runtime where family_id=$1 and key=$2 for update',
-          [this.familyId, 'conversation:' + String(job.payload.actor)]);
-        if (!rows[0]?.value?.pending || rows[0].value.requestId !== memory.weeklyConfirmation) {
-          throw new Error('반복 일정 확인 요청이 이미 처리됐거나 바뀌었어요.');
-        }
+      if (memory?.seriesCancellation) {
+        if (changes.length || settingsChange || memory.series) throw new Error('반복 일정 취소와 다른 변경이 섞였어요.');
+        const {id, version} = memory.seriesCancellation;
+        await updateScheduleSeries(c,this.familyId,id,version,{status:'cancelled'},job.payload.actor);
       }
-      if (memory?.weeklyKey) {
+      if (memory?.series) {
+        if (changes.some(change => !change.before)) throw new Error('반복 일정과 개별 일정은 함께 등록할 수 없어요.');
         const key = [this.familyId, memory.weeklyKey];
-        const inserted = changes.length && (await c.query(
+        const reserved = await c.query(
           'insert into assistant.runtime(family_id,key,value) values($1,$2,$3) on conflict do nothing',
-          [...key, {reply, refs:memory.refs}]
-        )).rowCount;
-        if (!inserted) {
+          [...key, {}]
+        );
+        if (reserved.rowCount) {
+          if (!await hasScheduleSchema(c)) throw new Error('반복 일정 저장 스키마가 필요합니다.');
+          const series = await createScheduleSeries(c,this.familyId,memory.series,job.payload.actor);
+          memory.refs = memory.occurrenceAnchors.map(anchor => ({
+            id:occurrenceId(this.familyId,series.id,anchor),title:series.title
+          }));
+          await c.query('update assistant.runtime set value=$3 where family_id=$1 and key=$2',
+            [...key,{reply,refs:memory.refs}]);
+        } else {
           const {rows} = await c.query('select value from assistant.runtime where family_id=$1 and key=$2', key);
-          const saved = rows[0]?.value;
-          if (saved) {
-            changes = [];
-            reply = '이미 처리된 요청이에요. 이번에 새로 등록한 일정은 0건이에요.\n\n이전 등록 결과\n' + saved.reply;
-            memory.refs = saved.refs;
-            memory.conversation.taskIds = saved.refs.map(t => t.id);
-            memory.conversation.request.candidateOrder = memory.conversation.taskIds;
-            memory.conversation.turns.at(-1).text = reply.slice(0, 1600);
-          }
+          const saved = rows[0].value;
+          reply = '이미 처리된 요청이에요. 이번 요청에서 새로 등록한 일정은 0건이에요.\n\n이전 등록 결과\n' + saved.reply;
+          memory.refs = saved.refs;
         }
+        memory.conversation.taskIds = memory.refs.map(t => t.id);
+        memory.conversation.request.candidateOrder = memory.conversation.taskIds;
+        memory.conversation.turns.at(-1).text = reply.slice(0, 1600);
       }
       if (memory?.consumeButton) {
         const consumed = await c.query(
@@ -154,6 +182,10 @@ export class Store {
       }
       for (const change of changes) {
         const { before, after } = change;
+        if (before?.recurrence) {
+          await applyOccurrenceChange(c,this.familyId,job.payload.actor,change);
+          continue;
+        }
         if (before) {
           const update = await c.query('update assistant.tasks set version=$4,data=$5 where family_id=$1 and id=$2 and version=$3', [this.familyId, after.id, before.version, after.version, after]);
           if (!update.rowCount) throw new Error('다른 작업에서 목록이 변경됐습니다. 다시 요청해주세요.');
@@ -181,27 +213,48 @@ export class Store {
       const r = await c.query("update assistant.jobs set status='failed',error=$4,finished_at=now() where family_id=$1 and id=$2 and lease=$3 and status='running'", [this.familyId, job.id, job.lease, text]);
       if (r.rowCount && !silent) {
         // An uncertain COMMIT can only be reported as a rollback if this job is still running.
-        const reason = weeklySave ? '일괄 저장이 취소되어 등록된 일정은 0건이에요.'
+        const reason = weeklySave ? '반복 일정 저장이 취소되어 새로 등록된 시리즈는 0건이에요.'
           : /Codex|CLI|doctor/.test(text) ? 'AI 연결이나 응답에 문제가 있어요. 잠시 후 다시 요청해주세요.' : text;
         await this.enqueue(c, 'error:' + job.id, '⚠️ 처리를 완료하지 못했어요\n\n' + reason + '\n\n문제를 해결한 뒤 같은 내용을 다시 보내주세요.');
       }
     });
   }
   async enqueue(c, id, text, task = null) {
+    if (id.startsWith('series-reminder:')) {
+      const instant = id.slice(('series-reminder:' + task.id + ':').length);
+      return c.query(`insert into assistant.deliveries(family_id,id,text,task_id,task_version)
+        select family_id,$2,$3,id,version from assistant.tasks where family_id=$1 and id=$4 and version=$5
+        and not exists (select 1 from assistant.deliveries d where d.family_id=$1 and d.task_id=$4
+          and d.id like 'reminder:%' and right(d.id,length($6::text)+1)=':' || $6
+          and d.status in ('pending','sending','sent','uncertain'))
+        for update on conflict(family_id,id) do update set text=excluded.text,task_version=excluded.task_version,
+        status='pending',next_attempt=now() where assistant.deliveries.status='cancelled'`,
+        [this.familyId,id,text,task.id,task.version,instant]);
+    }
     return c.query(`insert into assistant.deliveries(family_id,id,text,task_id,task_version) values($1,$2,$3,$4,$5) on conflict(family_id,id) do update set text=excluded.text,status='pending',next_attempt=now() where assistant.deliveries.status='cancelled' and (excluded.id like 'daily:%' or excluded.id like 'weekly:%')`, [this.familyId, id, text, task?.id || null, task?.version || null]);
   }
   async schedule(id, text, task = null) { await this.tx(c => this.enqueue(c, id, text, task)); }
-  async scheduleBrief(id,text,version){
+  async scheduleBrief(id,text,version,refs){
     await this.tx(async c=>{
       const r=await c.query('select settings_version,active from assistant.families where id=$1 for update',[this.familyId]);
-      if(r.rows[0]?.active && r.rows[0].settings_version===version)await this.enqueue(c,id,text);
+      if(r.rows[0]?.active && r.rows[0].settings_version===version) {
+        const inserted = await this.enqueue(c,id,text);
+        if (inserted.rowCount && refs) {
+          await c.query('update assistant.deliveries set result=$3 where family_id=$1 and id=$2',
+            [this.familyId,id,{context:{refs}}]);
+        }
+      }
     });
   }
   async missed(entries) {
     await this.tx(async c => {
       const fresh = [];
       for (const e of entries) {
-        const sent = await c.query('select status from assistant.deliveries where family_id=$1 and id=$2', [this.familyId, 'reminder:' + e.key]);
+        const sent = e.legacyTaskId
+          ? await c.query(`select status from assistant.deliveries where family_id=$1 and status='sent'
+            and (id=$2 or (task_id=$3 and id like 'reminder:%' and right(id,length($4::text)+1)=':' || $4)) limit 1`,
+          [this.familyId,e.deliveryId,e.legacyTaskId,e.instant])
+          : await c.query('select status from assistant.deliveries where family_id=$1 and id=$2',[this.familyId,'reminder:' + e.key]);
         if (sent.rows[0]?.status === 'sent') continue;
         const result = await c.query('insert into assistant.runtime(family_id,key,value) values($1,$2,$3) on conflict do nothing', [this.familyId, 'missed:' + e.key, { at: new Date().toISOString() }]);
         if (result.rowCount) fresh.push(e);
@@ -243,7 +296,11 @@ export class Store {
       await c.query('set transaction isolation level repeatable read');
       const result = { exportedAt: new Date().toISOString(), familyId: this.familyId };
       for (const table of ['families','tasks','history','jobs','deliveries','context','runtime',...( (await c.query("select to_regclass('assistant.members') as name")).rows[0].name ? ['members','settings_history'] : [])]) result[table] = (await c.query(`select * from assistant.${table} where ${table === 'families' ? 'id' : 'family_id'}=$1`, [this.familyId])).rows;
+      await addScheduleBackup(c,this.familyId,result);
       return result;
     });
+  }
+  async restoreBackup(snapshot) {
+    return this.tx(c => restoreFamilyBackup(c,this.familyId,snapshot));
   }
 }

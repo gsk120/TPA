@@ -1,4 +1,5 @@
-import {validDay} from './time.js';
+import {today,validDay} from './time.js';
+import {occurrenceWindow,withinOccurrenceWindow} from './recurrence.js';
 import {formatList} from './format.js';
 
 // Input tasks are loaded by the family-scoped Store, never by a model-supplied family ID.
@@ -9,7 +10,9 @@ export function retrieveTasks(tasks, query, now, timeZone){
  if(query.from&&query.to&&query.from>query.to)throw new Error('조회 기간의 시작과 끝을 확인해주세요.');
  for(const k of ['person','search'])if(query[k]!=null&&(typeof query[k]!=='string'||!query[k].trim()||query[k].length>120))throw new Error('조회 조건을 확인하지 못했어요.');
  const normalize=s=>String(s||'').normalize('NFKC').toLowerCase().replace(/\s/g,'');
+ const window=occurrenceWindow(today(now,timeZone),query.from,query.to);
  const selected=tasks.filter(t=>query.status==='all'||(query.status==='active'?!['done','cancelled'].includes(t.status):t.status===query.status))
+ .filter(t=>!t.recurrence||withinOccurrenceWindow(t,window))
  .filter(t=>(!query.from||(t.endDate||t.dueDate)>=query.from)&&(!query.to||t.dueDate&&t.dueDate<=query.to))
  .filter(t=>!query.person||normalize(t.person).includes(normalize(query.person))||normalize(t.assignee).includes(normalize(query.person)))
  .filter(t=>!query.search||normalize(t.title).includes(normalize(query.search)))
@@ -19,5 +22,7 @@ export function retrieveTasks(tasks, query, now, timeZone){
  const shown=[];let size=0;
  for(const t of selected){const length=JSON.stringify(t).length;if(shown.length>=100||size+length>18000)break;shown.push(t);size+=length;}
  const reply='📋 조회 조건 · '+conditions+'\n\n'+(selected.length?formatList(shown,query.status==='active'?'all':'query',now,timeZone):'해당 조건의 일정·할 일이 없어요.')+(shown.length<selected.length?'\n\n전체 '+selected.length+'건 중 '+shown.length+'건을 표시했어요. 기간이나 대상을 좁혀 이어서 조회해주세요.':'');
- return {tasks:shown,reply,total:selected.length,truncated:shown.length<selected.length};
+ const coverage = !query.from && !query.to
+   ? '\n\n반복 일정은 오늘부터 30일 이내 회차만 표시해요. 더 먼 회차는 날짜를 지정해 조회해주세요.' : '';
+ return {tasks:shown,reply:reply+coverage,total:selected.length,truncated:shown.length<selected.length};
 }

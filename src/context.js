@@ -1,5 +1,5 @@
 import {randomUUID} from 'node:crypto';
-import {today,addDays,validDay} from './time.js';
+import {today,addDays,timeTypes,validClock,validDay,validTimeZone} from './time.js';
 const compact=s=>String(s||'').normalize('NFKC').toLowerCase().replace(/[\s?!.,~]/g,'');
 export function quickCommand(text){
  const s=compact(text).replace(/^!/,'');
@@ -13,7 +13,7 @@ export function followup(text){if(/추가|새로/.test(text))return false;if(/(?
 export const settingsIntent=text=>/(?:점검|알림|시간대|타임존)/.test(text)&&/(?:매일|매주|주간|일일|중지|재개|설정|시간대|타임존)/.test(text);
 const stops=new Set(['일정','과업','할일','목록','오늘','내일','모레','이번주','다음주','지난주','전체','모두','관련','언제','왜','뭐','뭐야','그거','그건','그걸','그것','알려줘','보여줘','조회','찾아줘','해주세요','해줘','추가','추가해줘','등록','등록해줘','예약','변경','변경해줘','미뤄줘','바꿔줘','완료','완료했어','완료해줘','취소','취소해줘','끝','했어','지난','작년','올해','다음','현재','준비','오전','오후','까지','결정','날짜','시간']);
 export function searchTerms(text){return [...new Set((text.match(/[가-힣A-Za-z0-9_-]+/gu)||[]).map(t=>t.replace(/(?:했는데|했어|해줘|까지|으로|한테|에게|에서|은|는|을|를|이|가|도|에|로)$/u,'')).filter(t=>t.length>=2&&!/^\d+$/.test(t)&&!stops.has(t)&&!/[월일시분]$/.test(t)))].slice(0,12);}
-function matchTarget(tasks, target) {
+export function matchTarget(tasks, target) {
  const normalized = compact(target);
  if (!normalized) return [];
  const exact = tasks.filter(t => compact(t.title) === normalized);
@@ -81,13 +81,24 @@ export function nextConversation(actor,text,reply,taskIds,previous,now=new Date(
 }
 export function messageReferences(parts,refs){return parts.map(part=>[...new Set(refs.filter(t=>part.includes(t.title.replace(/[\r\n]+/g,' ').trim())).map(t=>t.id))]);}
 export function summarizeHistory(events){return events.map(e=>({actor:e.actor,task_id:e.task_id,at:e.at,reason:(e.reason||'').slice(0,250),reasonTruncated:(e.reason||'').length>250,before:summary(e.before),after:summary(e.after)}));}
-function summary(t){if(!t)return null;return Object.fromEntries(['id','title','kind','status','dueDate','time','endDate','timeNote','person','assignee','actualDeadline'].filter(k=>k in t).map(k=>[k,t[k]]));}
+function summary(t){if(!t)return null;return Object.fromEntries(['id','title','kind','status','dueDate','time','endDate','endTime','timeType','timeNote','sourceTimeZone','person','assignee','actualDeadline'].filter(k=>k in t).map(k=>[k,t[k]]));}
 
 export function validateClarification(value,allowedIds){
  if(!value)return null;
  if(!['update','create','settings','unknown'].includes(value.operation)||!Array.isArray(value.candidateIds)||value.candidateIds.some(id=>!allowedIds.includes(id))||new Set(value.candidateIds).size!==value.candidateIds.length||typeof value.question!=='string'||!value.question.trim()||value.question.length>2000||typeof value.unresolved!=='string'||value.unresolved.length>1000||!Array.isArray(value.proposedChanges)||value.proposedChanges.length>20)throw new Error('AI 응답의 확인 질문 형식이 올바르지 않아요.');
- const fields=['title','kind','status','dueDate','time','endDate','timeNote','person','assignee','notes','followUpDate','actualDeadline','timeZone','dailyTime','weeklyTime','weeklyDay','dailyEnabled','weeklyEnabled'];
- for(const p of value.proposedChanges){if(!fields.includes(p.field)||!['string','number','boolean'].includes(typeof p.value)&&p.value!==null||typeof p.value==='string'&&p.value.length>4000)throw new Error('AI 응답의 제안된 변경값을 확인하지 못했어요.');if(['dueDate','endDate','followUpDate','actualDeadline'].includes(p.field)&&p.value!==null&&!validDay(p.value))throw new Error('AI 응답의 제안된 날짜를 확인하지 못했어요.');}
+ const fields=['title','kind','status','dueDate','time','endDate','endTime','timeType','timeNote','sourceTimeZone','person','assignee','notes','followUpDate','actualDeadline','timeZone','dailyTime','weeklyTime','weeklyDay','dailyEnabled','weeklyEnabled'];
+ for (const {field,value:proposed} of value.proposedChanges) {
+  if (!fields.includes(field) || proposed !== null && !['string','number','boolean'].includes(typeof proposed)
+    || typeof proposed === 'string' && proposed.length > 4000) throw new Error('AI 응답의 제안된 변경값을 확인하지 못했어요.');
+  if (proposed === null) continue;
+  if (['dueDate','endDate','followUpDate','actualDeadline'].includes(field) && !validDay(proposed)) {
+   throw new Error('AI 응답의 제안된 날짜를 확인하지 못했어요.');
+  }
+  if ((field === 'timeType' && !timeTypes.includes(proposed))
+    || (field === 'endTime' && !validClock(proposed)) || (field === 'sourceTimeZone' && !validTimeZone(proposed))) {
+   throw new Error('AI 응답의 제안된 시간 유형이나 시각을 확인하지 못했어요.');
+  }
+ }
  return value;
 }
 

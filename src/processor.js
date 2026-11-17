@@ -1,9 +1,8 @@
 import {retrieveTasks} from './retrieval.js';
 import {formatList,formatReceipt,formatDetail,groupTasks} from './format.js';
 import { listTasks, briefing } from './briefing.js';
-import { dueBriefs, kst } from './time.js';
+import { addDays, dueBriefs, kst, today } from './time.js';
 import {defaults,settingsText} from './settings.js';
-import {processWeekly} from './weekly.js';
 import {quickCommand,nextConversation,detailQuery,detailCandidates,selectedDetail,followup,searchTerms} from './context.js';
 
 import { buttonFor } from './buttons.js';
@@ -24,15 +23,16 @@ async function isPendingAnswer(job, text, previous, reference, button, now, load
       || (previous.workflow && previous.workflow.chatId !== String(job.payload.chatId))
       || Date.parse(previous.expiresAt) <= +now) return false;
   if (button) return true;
-  if (/추가|새로|등록/u.test(text)) return false;
+  if (/추가|새로|등록/u.test(text) && !(previous.request?.seriesDraft && job.payload.replyTo)) return false;
   if (job.payload.replyTo) {
     return reference?.pending && reference.requestId === previous.requestId
       && (!previous.workflow || reference.workflowToken === previous.workflow.token)
       && reference.ownerActor === String(job.payload.actor) && reference.chatId === String(job.payload.chatId)
       && Date.parse(reference.expiresAt) > +now;
   }
-  const namedCommand = /완료|변경|바꿔|미뤄|취소|수정|조회|보여|알려/u.test(text) && searchTerms(text).length;
-  return (!namedCommand && followup(text)) || (previous.taskIds.length > 0
+  const namedCommand = /완료|변경|바꿔|미뤄|취소|삭제|수정|조회|보여|알려/u.test(text) && searchTerms(text).length;
+  return (!namedCommand && (followup(text) || previous.request?.seriesDraft && text.length <= 80
+    || previous.request?.seriesCancellation && /^(?:전체|시리즈|회차)/u.test(text))) || (previous.taskIds.length > 0
     && (await loadTasks()).some(t => previous.taskIds.includes(t.id)
       && t.title === text.replace(/(?:만|이요|야|요)[.!\s]*$/u, '')));
 }
@@ -58,7 +58,7 @@ export const help = `📋 토비 사용법
 !로 시작하거나 토비를 멘션·답장하면 돼요.
 자연어 해석에는 AI 사용량이 발생하며 명확한 고정 조회는 AI 없이 처리해요.`;
 
-async function processButton(job, store, tasks, now, options) {
+async function processButton(job, store, loadTasks, now, options) {
   const {token, index} = job.payload.button;
   const action = await store.runtimeValue('button:' + token);
   if (!action || action.actor !== String(job.payload.actor) || action.chatId !== String(job.payload.chatId)
@@ -69,16 +69,19 @@ async function processButton(job, store, tasks, now, options) {
       throw new Error('버튼이 이미 처리됐거나 만료됐어요.');
     }
     const target = action.targets[index];
+    const tasks = await loadTasks(target ? [target.id] : []);
     const task = target && tasks.find(t => t.id === target.id && t.version === target.version);
     if (!task) throw new Error('선택한 일정이 바뀌었어요. 현재 일정으로 다시 요청해주세요.');
     return {action, task, state};
   }
   if (action.kind !== 'undo' || index !== 0) throw new Error('버튼을 확인하지 못했어요.');
+  const tasks = await loadTasks(action.changes.map(({after}) => after.id));
   const changes = action.changes.map(({before, after}) => {
     const current = tasks.find(t => t.id === after.id && t.version === after.version);
     if (!current) throw new Error('되돌릴 수 없어요. 요청에 포함된 일정이 그사이 다시 변경됐어요.');
     const restored = before || {...current, status:'cancelled', completedAt:null, remindAt:[]};
-    return {before:current, after:{...restored, version:current.version + 1, updatedAt:now.toISOString()}, reason:'변경 되돌리기'};
+    return {before:current, after:{...restored, version:current.version + 1, updatedAt:now.toISOString()}, reason:'변경 되돌리기',
+      ...(current.recurrence ? {restoreTiming:restored.recurrence?.timing} : {})};
   });
   const settings = action.settings && {
     before:action.settings.after, after:action.settings.before, version:action.settings.version + 1
@@ -91,13 +94,14 @@ async function processButton(job, store, tasks, now, options) {
 
 export async function processJob(job, store, ai, now = new Date(), signal, options = {}) {
   const actorState=await store.conversation?.(job.payload.actor)||null;
-  if (!job.payload.button) {
-    const weeklyReply = await processWeekly(job, store, now, options, actorState);
-    if (weeklyReply !== null) return weeklyReply;
-  }
   let tasks;
-  const loadTasks = () => tasks ??= store.tasks();
-  const buttonInput = job.payload.button ? await processButton(job, store, await loadTasks(), now, options) : null;
+  const current=options.settings||defaults;
+  const actorIds = actorState?.actor === String(job.payload.actor) && Date.parse(actorState.expiresAt) > +now
+    ? actorState.taskIds ?? [] : [];
+  const readTasks = extra => store.calendarTasks?.({now,timeZone:current.timeZone,includeIds:actorIds,...extra}) ?? store.tasks();
+  const loadTasks = range => range
+    ? readTasks({from:range.from,to:range.to,includeIds:[],listOnly:true}) : tasks ??= readTasks();
+  const buttonInput = job.payload.button ? await processButton(job, store, includeIds => readTasks({includeIds}), now, options) : null;
   if (buttonInput?.reply) return buttonInput.reply;
   const originalText = buttonInput?.action.text ?? job.payload.text.trim();
   const naturalDetail=detailQuery(originalText);
@@ -107,8 +111,7 @@ export async function processJob(job, store, ai, now = new Date(), signal, optio
   const selectedId=validDetailState?selectedDetail(originalText,actorState.request)||(!/(완료|변경|바꿔|미뤄|취소|추가|등록)/.test(originalText)?detailCandidates((await loadTasks()).filter(t=>actorState.taskIds.includes(t.id)),originalText.replace(/(?:만|이요|야|요|보여줘|알려줘|볼래|선택할게)[.!\s]*$/u,'')).filter((t,i,list)=>list.length===1)[0]?.id:null):null;
   const text = quickCommand(originalText)||(selectedId?'/detail '+selectedId:naturalDetail?'/detail '+naturalDetail:originalText);
   const command = text.match(/^\/(\w+)(?:@[\w]+)?(?:\s+([\s\S]+))?$/);
-  let reply, changes = [], settingsChange=null, refs=[], conversation=null, retrievalReply=null, button=null, resumeToken;
-  const current=options.settings||defaults;
+  let reply, changes = [], settingsChange=null, refs=[], conversation=null, retrievalReply=null, button=null, resumeToken, seriesRegistration, seriesCancellation;
   if (command) {
     const name = command[1].toLowerCase(), arg = command[2]?.trim();
     const internalDetail=name==='detail'&&(!!selectedId||!!naturalDetail);
@@ -117,7 +120,9 @@ export async function processJob(job, store, ai, now = new Date(), signal, optio
     else if(name==='start')reply='안녕하세요, 토비예요. 비공개 가족방에서 !로 시작하거나 제 메시지에 답장해 부탁해주세요.';
     else if(name==='help')reply=help;
     else if (['today','week','list'].includes(name)) {
-      const tasks = await loadTasks();
+      const day = today(now,current.timeZone);
+      const range = name === 'list' ? {} : {from:day,to:name === 'today' ? day : addDays(day,6)};
+      const tasks = await loadTasks(range);
       const mode = name === 'list' ? 'all' : name;
       const selected = listTasks(tasks, mode, now,current.timeZone); refs=mode==='today'?tasks.filter(t=>!['done','cancelled'].includes(t.status)):selected; reply = mode==='today'?briefing(tasks,'daily',now,[],current.timeZone):mode==='all'?retrieveTasks(tasks,{kind:'task_list',status:'active',from:null,to:null,person:null,search:null},now,current.timeZone).reply:formatList(selected,mode,now,current.timeZone);
     } else if(name==='detail'){
@@ -128,6 +133,15 @@ export async function processJob(job, store, ai, now = new Date(), signal, optio
   } else {
     const previous = buttonInput?.state || actorState;
     const reference = await loadReplyReference(job, store);
+    if (store.calendarTasks) {
+      const replyIds = reference?.chatId === String(job.payload.chatId) && Date.parse(reference.expiresAt) > +now
+        ? reference.taskIds ?? [] : [];
+      if (replyIds.length) {
+        tasks = readTasks({includeIds:[...replyIds,...actorIds]});
+        const aliases = new Map((await tasks).filter(t => t.recurrence).map(t => [t.recurrence.occurrenceId,t.id]));
+        reference.taskIds = replyIds.map(id => aliases.get(id) ?? id);
+      }
+    }
     const pendingAnswer = await isPendingAnswer(job, originalText, previous, reference, buttonInput, now, loadTasks);
     const resume = pendingAnswer && !!previous.workflow;
     if (!resume && reference?.workflowToken && reference.pending && !/추가|새로|등록/u.test(originalText)) {
@@ -141,12 +155,15 @@ export async function processJob(job, store, ai, now = new Date(), signal, optio
           job, ai, signal, now, options, current, loadTasks, originalText, classification, previous, resumedIntent
         }),
         planWithContext:async (classification, resumedIntent) => planNatural({
-          job, store, ai, now, signal, options, current, tasks:await loadTasks(), originalText,
+          job, store, ai, now, signal, options, current,
+          tasks:classification?.cancellation && classification.cancellation.scope !== 'occurrence' ? [] : await loadTasks(),
+          loadTasks, originalText,
           previous, reference, buttonInput, classification, resumedIntent, resumed:resume
         })
       });
       ({reply, changes = [], settingsChange = null, refs = [], conversation = null, retrievalReply = null, button = null} = result);
       resumeToken = result.resumeToken;
+      ({seriesRegistration, seriesCancellation} = result);
     }
   }
   if (retrievalReply&&settingsChange&&!changes.length)reply+='\n\n✅ 알림 설정 저장 완료\n\n'+settingsText(settingsChange.after);
@@ -161,17 +178,25 @@ export async function processJob(job, store, ai, now = new Date(), signal, optio
     button = buttonFor(job, now, {kind:'undo', changes, settings:settingsChange}, ['↩️ 방금 변경 되돌리기']);
   }
   await options.authorize?.();
-  await store.finish(job, changes, reply,settingsChange,{button,consumeButton:job.payload.button?.token,resumeToken,refs:refs.map(t=>({id:t.id,title:t.title})),conversation,expiresAt:new Date(now.getTime()+30*86400000).toISOString()});
-  return reply;
+  try {
+    const storedReply = await store.finish(job, changes, reply,settingsChange,{button,consumeButton:job.payload.button?.token,resumeToken,refs:refs.map(t=>({id:t.id,title:t.title})),conversation,expiresAt:new Date(now.getTime()+30*86400000).toISOString(),seriesCancellation,...seriesRegistration});
+    return seriesRegistration ? storedReply ?? reply : reply;
+  } catch (cause) {
+    if (!seriesRegistration || cause.message.startsWith('확인 요청이 이미')) throw cause;
+    throw new Error('반복 일정 저장 오류',{cause});
+  }
 }
 
 export async function schedule(store, now = new Date(), settings = defaults, settingsVersion = null) {
-  const tasks = await store.tasks();
+  const tasks = await (store.calendarTasks?.({now,timeZone:settings.timeZone}) ?? store.tasks());
   for (const item of dueBriefs(now,settings)) {
     // Deterministic factual summary still works if the CLI is offline.
     const history = item.type === 'weekly' ? await store.history() : [];
     const text=briefing(tasks, item.type, now, history,settings.timeZone);
-    if(settingsVersion!==null)await store.scheduleBrief(item.key,text,settingsVersion);
+    if(settingsVersion!==null) {
+      const refs = tasks.some(task => task.recurrence) ? tasks.map(({id,title}) => ({id,title})) : undefined;
+      await store.scheduleBrief(item.key,text,settingsVersion,refs);
+    }
     else await store.schedule(item.key,text);
   }
   const missed = [];
@@ -180,8 +205,11 @@ export async function schedule(store, now = new Date(), settings = defaults, set
     for (const instant of t.remindAt || []) {
       const age = now.getTime() - Date.parse(instant);
       if (age < 0) continue;
-      if (age <= 3600000) await store.schedule(`reminder:${t.id}:${t.version}:${instant}`, '🔔 예약 알림\n\n' + groupTasks([t],{now,timeZone:settings.timeZone}), t);
-      else missed.push({key:`${t.id}:${t.version}:${instant}`,text:`${t.title} — 예약 시각 ${kst(new Date(instant),settings.timeZone)} (${settings.timeZone})`});
+      const key = t.recurrence ? `${t.id}:${instant}` : `${t.id}:${t.version}:${instant}`;
+      const deliveryId = (t.recurrence ? 'series-reminder:' : 'reminder:') + key;
+      if (age <= 3600000) await store.schedule(deliveryId, '🔔 예약 알림\n\n' + groupTasks([t],{now,timeZone:settings.timeZone}), t);
+      else missed.push({key,deliveryId,...(t.recurrence ? {legacyTaskId:t.id,instant} : {}),
+        text:`${t.title} — 예약 시각 ${kst(new Date(instant),settings.timeZone)} (${settings.timeZone})`});
     }
   }
   if (missed.length) await store.missed(missed);
