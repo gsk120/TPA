@@ -53,7 +53,7 @@ export async function runNaturalWorkflow({ai, input, signal, planWithoutTarget, 
       const withoutTarget = ['create','retrieve','settings','unknown'].includes(intent);
       const plan = withoutTarget ? planWithoutTarget : planWithContext;
       const request = pending ? previous.request : null;
-      const turnClassification = request?.seriesCancellation
+      const turnClassification = request?.seriesCancellation || request?.dateCompletion && !request.dateCompletion.targets
         ? validateIntent(await ai.classify({
           ...input, now:new Date(request.startedAt),
           settings:{...input.settings,timeZone:request.timeZone}, pendingRequest:request

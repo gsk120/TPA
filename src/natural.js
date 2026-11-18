@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from 'node:util';
 import { retrieveTasks } from './retrieval.js';
 import { historyRequest } from './history-search.js';
 import { isActive, planChanges } from './tasks.js';
@@ -165,9 +166,78 @@ async function planSeriesCancellation({job, store, now, current, originalText, p
   return {reply, conversation};
 }
 
+// Both exact-title and date-selected completion use the existing multi-action validator/store.
+function completionChanges(tasks, now) {
+  return planChanges(tasks.map(task => ({
+    operation:'update', id:task.id, expectedVersion:task.version,
+    task:{...task, status:'done', remindAt:[]}, reason:'사용자의 완료 요청'
+  })), tasks, now);
+}
+
+async function planDateCompletion({job, now, current, loadTasks, originalText, previous, classification}) {
+  const pending = previous?.request.dateCompletion;
+  const completion = classification?.completion;
+  const timeZone = previous?.request.timeZone ?? current.timeZone;
+  const date = pending?.targets ? pending.date : completion?.date ?? null;
+  const response = (reply, refs = [], waiting = false, selection = null, changes = []) => {
+    const conversation = nextConversation(job.payload.actor, originalText, reply, refs.map(t => t.id),
+      previous, now, {continuation:!!previous, timeZone});
+    conversation.pending = waiting;
+    conversation.request.operation = 'complete';
+    conversation.request.question = waiting ? reply : null;
+    if (waiting) conversation.request.dateCompletion = selection;
+    else delete conversation.request.dateCompletion;
+    return {reply, refs, conversation, changes};
+  };
+  const rejected = /^(?:아니|아니요|아니오|거절|취소|안\s*할래)(?:요)?[.!\s]*$/u.test(originalText.trim());
+  if (pending && rejected) return response('완료 요청을 취소했어요. 일정은 변경하지 않았어요.');
+  if (!date) {
+    return response('❓ ' + (completion?.question ?? '완료할 하루의 날짜를 알려주세요.'), [], true,
+      {date:null, targets:null});
+  }
+  if (pending?.targets) {
+    const approved = /^(?:응|네|예|맞아|승인|좋아|모두|전부)(?:요)?[.!\s]*$/u.test(originalText.trim());
+    if (!approved) return response(previous.request.question, pending.targets, true, pending);
+  }
+  // Explicit range reads include past/future virtual occurrences and apply existing overlap rules.
+  const loaded = await loadTasks({from:date,to:date,timeZone});
+  const fixedIds = pending?.targets && new Set(pending.targets.map(target => target.id));
+  const result = retrieveTasks(fixedIds ? loaded.filter(task => fixedIds.has(task.id)) : loaded,
+    {kind:'task_list',status:'active',from:date,to:date,person:null,search:null}, now, timeZone);
+  if (pending?.targets) {
+    const byId = new Map(result.tasks.map(task => [task.id,task]));
+    const selected = pending.targets.map(target => byId.get(target.id));
+    if (result.truncated || selected.some((task, i) => !task || task.version !== pending.targets[i].version
+        || !isDeepStrictEqual(task.recurrence ?? null, pending.targets[i].recurrence))) {
+      return response('확인하는 동안 일정이 바뀌었어요. 저장하지 않았어요. 현재 일정으로 다시 요청해주세요.');
+    }
+    return response('', selected, false, null, completionChanges(selected,now));
+  }
+  if (!result.total) return response(date + '에 완료할 미완료 일정이 없어요.');
+  if (result.total > 20) {
+    return response(date + ' 미완료 일정 ' + result.total + '건이 있어요. 기존 1회 변경 한도(20건)를 넘어 저장하지 않았어요. 날짜 전체 완료의 한도 초과 처리는 별도 결정이 필요해요.');
+  }
+  if (result.truncated) return response('대상 자료의 조회 한도를 넘어 저장하지 않았어요. 대상을 좁혀 다시 요청해주세요.');
+  const refs = result.tasks;
+  const reply = date + ' 미완료 일정 ' + refs.length + '건이 있습니다.\n\n'
+    + refs.map((task,i) => `${i+1}. ${task.title.replace(/[\r\n]+/g,' ')} · ${task.dueDate}${task.time ? ' ' + task.time : ''}`).join('\n')
+    + `\n\n${refs.length}건 모두 완료할까요? (네 / 아니요)`;
+  // nextConversation historically truncates questions/turns; retain this complete approval list.
+  if (reply.length > 16000) return response('대상 목록의 표시 한도를 넘어 저장하지 않았어요. 대상을 좁혀 다시 요청해주세요.');
+  return response(reply, refs, true, {date, targets:refs.map(task => ({
+    id:task.id, version:task.version, recurrence:task.recurrence ?? null,
+    title:task.title, dueDate:task.dueDate, time:task.time
+  }))});
+}
+
 export async function planNatural({job, store, ai, now, signal, options, current, tasks, loadTasks, originalText,
   previous, reference, buttonInput, classification, resumedIntent, resumed}) {
   let reply, changes = [], settingsChange = null, refs = [], conversation = null, retrievalReply = null, button = null;
+  if (resumed && previous.request.dateCompletion
+      || classification?.intent === 'complete' && classification.completion && classification.completion.scope !== 'named') {
+    return planDateCompletion({job,now,current,loadTasks,originalText,
+      previous:resumed ? previous : null,classification});
+  }
   const pendingSeries = resumed && previous.request.seriesCancellation;
   const cancellation = classification?.intent === 'cancel' ? classification.cancellation : null;
   const occurrence = cancellation?.scope === 'occurrence' ? cancellation : null;
@@ -280,10 +350,7 @@ export async function planNatural({job, store, ai, now, signal, options, current
     reply='❓ 대상을 확인해주세요\n\n'+selection.blocked+(refs.length?'\n\n'+refs.slice(0,10).map(t=>`${t.title} · ${t.dueDate||'날짜 미정'}`).join('\n'):'');
   } else if (directCompletion) {
     const [task] = refs;
-    changes = planChanges([{
-      operation:'update', id:task.id, expectedVersion:task.version,
-      task:{...task, status:'done', remindAt:[]}, reason:'사용자의 완료 요청'
-    }], tasks, now);
+    changes = completionChanges([task], now);
   } else {
     const selectedIds=selection.candidates.map(t=>t.id);
     const historyQuery=!classification || ['history','mixed'].includes(intent) ? historyRequest(originalText,now,current.timeZone) : null;

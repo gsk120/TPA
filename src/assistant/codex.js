@@ -48,7 +48,10 @@ create/retrieve/settings/unknown은 answer에 구조화한 답을 넣고 나머�
 반복일정의 취소·삭제는 intent=cancel로 분류하고 cancellation을 반환하세요. 일반 일정의 취소 및 그 외 의도는 cancellation=null입니다. 전체 반복일정을 취소한다는 의미가 명확하면 scope=series, 특정 한 회차이면 scope=occurrence입니다. date는 series의 경우 명시된 시리즈 시작일(YYYY-MM-DD) 또는 시작월(YYYY-MM), occurrence의 경우 특정 회차의 날짜(YYYY-MM-DD)이며 생략하면 null입니다. 날짜 단서는 제목인 targets에 넣지 마세요. 명확한 범위는 question=null입니다.
 시리즈 시작 조건과 부분 취소 범위가 모호하면 scope=null, date=null로 두고 어느 의미인지 question으로 물으세요. 예를 들어 '12월부터 반복하는 회의 전체 취소'가 12월 시작 시리즈를 뜻하는지 기존 시리즈의 12월 이후 회차를 뜻하는지 불명확하면 확인하세요. 일부 기간의 회차 취소가 명확하면 scope=null, date=null과 함께 전체 시리즈 또는 한 회차 중 원하는 범위를 물으세요. 확인 질문을 이어갈 때는 pendingRequest의 원래 요청과 기준 시각을 사용하고, 현재 답변이 무엇을 확정했는지 확인하세요. 답변이 모호성을 해소하지 못하면 계속 확인하세요.
 월간 조회는 가족 현지 달력 월입니다. '이번 주'는 기존 /week 범위(기준일부터 7일)입니다. 기준 시각은 아래에 있습니다.
-다음 정책과 입력을 따르되 최상위 출력 형식은 intent, targets, answer, cancellation입니다.
+완료 요청은 intent=complete를 유지하고 completion에 scope, date, question을 반환하세요. 다른 의도는 completion=null입니다. 일정 제목을 명시하면 scope=named로 두고 기존 targets에 제목 단서를 반환하세요. 날짜가 있어도 명시한 제목 외의 일정으로 확대하지 마세요. named의 date는 명확한 날짜가 있으면 YYYY-MM-DD, 없으면 null이며 question=null입니다.
+날짜만 지정해 그날 일정·작업·할 일 전체를 완료한다는 뜻이면 scope=date_all, targets=[], date=가족 시간대의 YYYY-MM-DD, question=null입니다. '11월 17일 일정 완료해줘'는 '전부'가 없어도 날짜 전체이며 '어제 작업들 모두 완료해줘', '오늘 할 일 다 끝냈어', '지난주 월요일 일정 전부 완료해줘'도 지원하세요. 오늘·어제는 아래 기준 시각, 지난주 월요일은 가족 현지 달력상 지난주의 월요일로 해석하세요. 기존 날짜 정책을 따르고 승인 답변 시 상대 날짜를 다시 계산하지 마세요.
+날짜 또는 명시적 대상과 날짜 전체 중 범위가 불명확하면 completion의 scope=null, date=null, targets=[]로 두고 question으로 필요한 정보만 물으세요. '지난주 일정 완료'처럼 하루가 특정되지 않으면 임의로 날짜나 일주일 전체를 선택하지 마세요. pendingRequest.dateCompletion이 있으면 원래 완료 요청과 현재 날짜 답변을 결합하되 날짜 전체의 실행 승인이나 대상 ID는 만들지 마세요. 날짜 전체는 프로그램이 대상 목록을 보여주고 별도로 승인받습니다.
+다음 정책과 입력을 따르되 최상위 출력 형식은 intent, targets, answer, cancellation, completion입니다.
 ${buildPrompt({tasks:[], history:[], context:[], message, now, settings, pendingRequest})}`;
 }
 

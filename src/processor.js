@@ -31,6 +31,10 @@ async function isPendingAnswer(job, text, previous, reference, button, now, load
       && Date.parse(reference.expiresAt) > +now;
   }
   const namedCommand = /완료|변경|바꿔|미뤄|취소|삭제|수정|조회|보여|알려/u.test(text) && searchTerms(text).length;
+  if (previous.request?.dateCompletion && !namedCommand) {
+    return !previous.request.dateCompletion.targets && text.length <= 80
+      || /^(?:응|네|예|맞아|승인|좋아|모두|전부|아니|아니요|아니오|거절|취소|안\s*할래)(?:요)?[.!\s]*$/u.test(text.trim());
+  }
   return (!namedCommand && (followup(text) || previous.request?.seriesDraft && text.length <= 80
     || previous.request?.seriesCancellation && /^(?:전체|시리즈|회차)/u.test(text))) || (previous.taskIds.length > 0
     && (await loadTasks()).some(t => previous.taskIds.includes(t.id)
@@ -100,7 +104,7 @@ export async function processJob(job, store, ai, now = new Date(), signal, optio
     ? actorState.taskIds ?? [] : [];
   const readTasks = extra => store.calendarTasks?.({now,timeZone:current.timeZone,includeIds:actorIds,...extra}) ?? store.tasks();
   const loadTasks = range => range
-    ? readTasks({from:range.from,to:range.to,includeIds:[],listOnly:true}) : tasks ??= readTasks();
+    ? readTasks({from:range.from,to:range.to,timeZone:range.timeZone ?? current.timeZone,includeIds:[],listOnly:true}) : tasks ??= readTasks();
   const buttonInput = job.payload.button ? await processButton(job, store, includeIds => readTasks({includeIds}), now, options) : null;
   if (buttonInput?.reply) return buttonInput.reply;
   const originalText = buttonInput?.action.text ?? job.payload.text.trim();

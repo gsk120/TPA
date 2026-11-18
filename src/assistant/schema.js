@@ -42,11 +42,15 @@ export const schema = {
 
 export const intentSchema = {
   type: 'object', additionalProperties: false,
-  required: ['intent', 'targets', 'answer', 'cancellation'],
+  required: ['intent', 'targets', 'answer', 'cancellation', 'completion'],
   properties: {
     intent: {type:'string', enum:['create','update','complete','cancel','retrieve','detail','history','settings','mixed','unknown']},
     targets: {type:'array', items:{type:'string'}},
     answer: {anyOf:[{type:'null'}, schema]},
+    completion: {anyOf:[{type:'null'},{type:'object',additionalProperties:false,
+      required:['scope','date','question'],properties:{
+        scope:{type:['string','null'],enum:['named','date_all',null]}, date:nullable, question:nullable
+      }}]},
     cancellation: {anyOf:[{type:'null'},{type:'object',additionalProperties:false,
       required:['scope','date','question'],properties:{
         scope:{type:['string','null'],enum:['series','occurrence',null]}, date:nullable, question:nullable
@@ -65,6 +69,15 @@ export function validateIntent(value) {
     throw new Error('AI가 요청에 필요한 정보를 확인하지 못했어요. 요청을 다시 말씀해주세요.');
   }
   const {cancellation} = value;
+  if (value.completion != null) {
+    const {scope, date, question} = value.completion;
+    const valid = scope === 'named' ? question === null && (date === null || validDay(date))
+      : scope === 'date_all' && validDay(date) && question === null
+        || scope === null && date === null && typeof question === 'string' && !!question.trim() && question.length <= 1000;
+    if (value.intent !== 'complete' || !valid || scope !== 'named' && value.targets.length) {
+      throw new Error('완료할 날짜와 대상 범위를 확인하지 못했어요.');
+    }
+  }
   if (cancellation != null) {
     const {scope, date, question} = cancellation;
     const validDate = date === null || (scope === 'series' && typeof date === 'string' && /^\d{4}-\d{2}$/.test(date)
