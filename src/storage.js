@@ -1,7 +1,7 @@
 import pg from 'pg';
 import { readFile } from 'node:fs/promises';
 import { randomUUID, createHash } from 'node:crypto';
-import { applyOccurrenceChange, createScheduleSeries, hasScheduleSchema, linkScheduleOccurrence, readActiveScheduleSeries, readCalendarTasks, updateScheduleSeries } from './schedule-store.js';
+import { applyOccurrenceChange, createScheduleSeries, hasScheduleSchema, linkScheduleOccurrence, lockRegistrationSeries, readActiveScheduleSeries, readCalendarTasks, updateScheduleSeries } from './schedule-store.js';
 import { occurrenceId } from './recurrence.js';
 import { addScheduleBackup, restoreFamilyBackup } from './schedule-backup.js';
 
@@ -148,19 +148,22 @@ export class Store {
           'insert into assistant.runtime(family_id,key,value) values($1,$2,$3) on conflict do nothing',
           [...key, {}]
         );
-        if (reserved.rowCount) {
+        // Serialize different jobs with the same semantic key, including replacements.
+        const {rows} = await c.query('select value from assistant.runtime where family_id=$1 and key=$2 for update', key);
+        const saved = rows[0].value;
+        const linked = !reserved.rowCount && await hasScheduleSchema(c)
+          ? await lockRegistrationSeries(c,this.familyId,saved) : null;
+        if (reserved.rowCount || linked?.status === 'cancelled') {
           if (!await hasScheduleSchema(c)) throw new Error('반복 일정 저장 스키마가 필요합니다.');
           const series = await createScheduleSeries(c,this.familyId,memory.series,job.payload.actor);
           memory.refs = memory.occurrenceAnchors.map(anchor => ({
             id:occurrenceId(this.familyId,series.id,anchor),title:series.title
           }));
           await c.query('update assistant.runtime set value=$3 where family_id=$1 and key=$2',
-            [...key,{reply,refs:memory.refs}]);
+            [...key,{seriesId:series.id,reply,refs:memory.refs}]);
         } else {
-          const {rows} = await c.query('select value from assistant.runtime where family_id=$1 and key=$2', key);
-          const saved = rows[0].value;
-          reply = '이미 처리된 요청이에요. 이번 요청에서 새로 등록한 일정은 0건이에요.\n\n이전 등록 결과\n' + saved.reply;
-          memory.refs = saved.refs;
+          reply = '이미 처리된 요청이에요. 이번 요청에서 새로 등록한 일정은 0건이에요.\n\n이전 등록 결과\n' + (saved?.reply ?? '이전 요청의 시리즈를 확인하지 못해 중복 등록을 보류했어요.');
+          memory.refs = Array.isArray(saved?.refs) ? saved.refs.filter(ref => typeof ref?.id === 'string') : [];
         }
         memory.conversation.taskIds = memory.refs.map(t => t.id);
         memory.conversation.request.candidateOrder = memory.conversation.taskIds;

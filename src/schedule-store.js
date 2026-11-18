@@ -18,6 +18,39 @@ function normalizeSeries(row) {
   return {...row, start_at:row.start_at == null ? null : dateString(row.start_at), end_at:row.end_at == null ? null : dateString(row.end_at)};
 }
 
+// The caller holds the request-key row lock until its result is replaced.
+export async function lockRegistrationSeries(c, familyId, saved) {
+  let id = saved?.seriesId;
+  if (id !== undefined) {
+    if (typeof id !== 'string' || !/^[\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12}$/iu.test(id)) return null;
+  } else {
+    // Legacy keys only have virtual occurrence UUIDs, often without saved rows.
+    // Match every reference cryptographically; a title or an empty list is not proof.
+    const refs = saved?.refs;
+    if (!Array.isArray(refs) || !refs.length || refs.some(ref => !occurrenceDay(ref?.id))) return null;
+    const matchesRefs = series => {
+      try {
+        return refs.every(ref => {
+          const day = occurrenceDay(ref.id);
+          // Temporarily expand cancelled rules for identity verification only.
+          return [...expandSeries({...series,status:'active'},day,day)]
+            .some(item => occurrenceId(familyId,series.id,item.anchor) === ref.id);
+        });
+      } catch { return false; }
+    };
+    const candidates = (await c.query(selectSeries + " and edit_mode='supported'",[familyId])).rows
+      .map(normalizeSeries).filter(matchesRefs);
+    if (candidates.length !== 1) return null;
+    id = candidates[0].id;
+    const row = (await c.query(selectSeries + ' and id=$2 for update',[familyId,id])).rows[0];
+    if (!row) return null;
+    const locked = normalizeSeries(row);
+    return locked.edit_mode === 'supported' && matchesRefs(locked) ? locked : null;
+  }
+  const row = (await c.query(selectSeries + ' and id=$2 for update',[familyId,id])).rows[0];
+  return row?.edit_mode === 'supported' ? normalizeSeries(row) : null;
+}
+
 export async function readActiveScheduleSeries(c, familyId) {
   const {rows} = await c.query(selectSeries + " and status='active' and edit_mode='supported' order by id", [familyId]);
   return rows.map(row => ({

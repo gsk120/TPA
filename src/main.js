@@ -7,7 +7,10 @@ import {routeUpdate} from './router.js';
 import {Telegram,splitMessage} from './telegram.js';
 import {messageReferences,quickCommand} from './context.js';
 import {Codex} from './assistant/codex.js';
-import {processJob,schedule} from './processor.js';
+import {schedule} from './processor.js';
+import {createJobDispatcher} from './core/router.js';
+import {createCalendarSkill} from './skills/calendar.js';
+const dispatchJob=createJobDispatcher([createCalendarSkill()],'calendar');
 let stopping=false;const shutdown=new AbortController();
 let runtime;
 function stop(){stopping=true;shutdown.abort();}
@@ -68,7 +71,7 @@ async function main(stage){
      const state=await families.settings(f);
      // Queue acknowledgement is durable and independent of a slow CLI answer.
      if(!job.payload.button&&!job.payload.text.startsWith('/')&&!quickCommand(job.payload.text))await store.schedule('accepted:'+job.id,'요청을 접수했어요. 순서대로 처리한 뒤 결과를 알려드릴게요.');
-     await processJob(job,store,ai,new Date(),signal,{settings:state.settings,settingsVersion:state.settings_version,authorize:()=>authorize(f,job.payload.actor)});
+     await dispatchJob({job,store,ai,now:new Date(),signal,options:{settings:state.settings,settingsVersion:state.settings_version,authorize:()=>authorize(f,job.payload.actor)}});
      if (job.payload.button?.messageId) {
        void tg.call('editMessageReplyMarkup', {
          chat_id:f.chat_id, message_id:job.payload.button.messageId, reply_markup:{inline_keyboard:[]}
