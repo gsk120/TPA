@@ -10,6 +10,7 @@ import {Codex} from './assistant/codex.js';
 import {schedule} from './processor.js';
 import {createSkillRouter} from './core/router.js';
 import {createCalendarSkill,inspectCalendarEntry} from './skills/calendar.js';
+import {debugEvent,errorFields,jobDebug,jobTrace,withJobTrace} from './diagnostics.js';
 let stopping=false;const shutdown=new AbortController();
 let runtime;
 function stop(){stopping=true;shutdown.abort();}
@@ -68,27 +69,43 @@ async function main(stage){
   const worker=async()=>{while(!stopping){let worked=false;try{
    for(const f of await families.list()){
     if(stopping)break;if(!f.active||busy.has(f.id))continue;busy.add(f.id);
-    const store=families.store(f);let job,timer,signal;
+    const store=families.store(f);let job,timer,signal,trace,phase='claim';
     try{
      job=await store.claim();if(!job)continue;worked=true;
+     trace=jobTrace(f.id,job.id);
+     debugEvent(trace,'worker.claim',{attempt:job.attempts+1});
      const controller=new AbortController();signal=AbortSignal.any([controller.signal,shutdown.signal]);let beating=false;
-     timer=setInterval(async()=>{if(beating)return;beating=true;try{await store.heartbeat(job);}catch{controller.abort();}finally{beating=false;}},20000);
+     timer=setInterval(async()=>{if(beating)return;beating=true;try{await store.heartbeat(job);}catch(error){
+      debugEvent(trace,'worker.heartbeat.error',errorFields(error));controller.abort();
+     }finally{beating=false;}},20000);
+     phase='initial-authorize';
      await authorize(f,job.payload.actor);
+     phase='settings-read';
      const state=await families.settings(f);
      // Queue acknowledgement is durable and independent of a slow CLI answer.
+     phase='receipt-save';
      if(!job.payload.button&&!job.payload.text.startsWith('/')&&!quickCommand(job.payload.text))await store.schedule('accepted:'+job.id,'요청을 접수했어요. 순서대로 처리한 뒤 결과를 알려드릴게요.');
-     await dispatchJob({job,store,ai,now:new Date(),signal,options:{settings:state.settings,settingsVersion:state.settings_version,authorize:()=>authorize(f,job.payload.actor)}});
+     phase='dispatch';
+     await withJobTrace(trace,()=>dispatchJob({job,store,ai,now:new Date(),signal,options:{
+      settings:state.settings,settingsVersion:state.settings_version,authorize:async()=>{
+       jobDebug('worker.authorize.start');
+       await authorize(f,job.payload.actor);
+       jobDebug('worker.authorize.done');
+      }
+     }}));
+     debugEvent(trace,'worker.dispatch.returned');
      if (job.payload.button?.messageId) {
        void tg.call('editMessageReplyMarkup', {
          chat_id:f.chat_id, message_id:job.payload.button.messageId, reply_markup:{inline_keyboard:[]}
        }, 3000).catch(() => {});
      }
     }catch(e){
+     debugEvent(trace,'worker.error',{phase,abortSource:shutdown.signal.aborted?'shutdown':signal?.aborted?'heartbeat':undefined,...errorFields(e)});
      if(e.codexFailure)console.error('Codex CLI 실패',e.codexFailure.stage,e.codexFailure.category);
-     if(job&&!signal?.aborted)await store.fail(job,safeError(e), {
+     if(job&&!signal?.aborted)await withJobTrace(trace,()=>store.fail(job,safeError(e), {
        silent: !!job.payload.button && e.message === '버튼이 이미 처리됐거나 만료됐어요.',
        weeklySave: e.message === '반복 일정 저장 오류'
-     }).catch(()=>{});
+     })).catch(error=>debugEvent(trace,'worker.failure_save.error',errorFields(error)));
     }
     finally{clearInterval(timer);busy.delete(f.id);}
    }
@@ -100,8 +117,25 @@ async function main(stage){
    if(stopping)break;if(!f.active)continue;const store=families.store(f);
    try{await verifyBot(tg,bot,f.chat_id);}catch{continue;}
    const d=await store.claimDelivery();if(!d)continue;sent=true;
-   try{const memory=await store.referencesForDelivery(d);const linked=memory?.refs??(/^(daily:|weekly:|reminder:|series-reminder:|missed:)/.test(d.id)?await store.tasks():[]);const parts=splitMessage(d.text);const ids=await tg.send(f.chat_id,d.text,memory?.replyMarkup);await store.deliveryResult(d,'sent',{messageIds:ids,chatId:f.chat_id,messageRefs:messageReferences(parts,linked),replyOwner:memory?.ownerActor,replyPending:memory?.pending,requestId:memory?.requestId,workflowToken:memory?.workflowToken});}
-   catch(e){const status=e.retryAfter&&d.attempts<3?'pending':e.uncertain||!e.message?.startsWith('텔레그램')?'uncertain':'failed';await store.deliveryResult(d,status,{reason:safeError(e)},Math.min(e.retryAfter||0,3600));}
+   const match=/^(accepted|reply|error):((?:tg|button):.+)$/.exec(d.id);
+   const deliveryTrace=match&&jobTrace(f.id,match[2]);
+   const deliveryKind=match?.[1];
+   let deliveryPhase='prepare';
+   try{
+    const memory=await store.referencesForDelivery(d);const linked=memory?.refs??(/^(daily:|weekly:|reminder:|series-reminder:|missed:)/.test(d.id)?await store.tasks():[]);
+    const parts=splitMessage(d.text);
+    deliveryPhase='telegram-send';
+    debugEvent(deliveryTrace,'delivery.send',{kind:deliveryKind,attempt:d.attempts+1});
+    const ids=await tg.send(f.chat_id,d.text,memory?.replyMarkup);
+    deliveryPhase='result-save';
+    await store.deliveryResult(d,'sent',{messageIds:ids,chatId:f.chat_id,messageRefs:messageReferences(parts,linked),replyOwner:memory?.ownerActor,replyPending:memory?.pending,requestId:memory?.requestId,workflowToken:memory?.workflowToken});
+    debugEvent(deliveryTrace,'delivery.done',{kind:deliveryKind,pendingQuestion:!!memory?.pending,
+     question:memory?.pending&&memory.requestId?jobTrace('calendar-question',memory.requestId):undefined});
+   }catch(e){
+    const status=e.retryAfter&&d.attempts<3?'pending':e.uncertain||!e.message?.startsWith('텔레그램')?'uncertain':'failed';
+    debugEvent(deliveryTrace,'delivery.error',{kind:deliveryKind,phase:deliveryPhase,status,...errorFields(e)});
+    await store.deliveryResult(d,status,{reason:safeError(e)},Math.min(e.retryAfter||0,3600));
+   }
    await pause(3100);
   }}catch{console.error('발송·DB 확인 실패.');await pause(10000);}if(!sent)await pause(1500);}};
   await Promise.all([poll(),worker(),worker(),scheduler(),deliver()]);

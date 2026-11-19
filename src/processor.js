@@ -4,11 +4,12 @@ import { listTasks, briefing } from './briefing.js';
 import { addDays, dueBriefs, kst, today } from './time.js';
 import {defaults,settingsText} from './settings.js';
 import {quickCommand,nextConversation,detailQuery,detailCandidates,selectedDetail,followup,searchTerms,liveCalendarState,calendarStateKey} from './context.js';
-import { calendarContextChanged, calendarPendingNotice, isCalendarQuestionReply, isUsableCalendarReply, loadReplyReference } from './calendar-entry.js';
+import { calendarContextChanged, finishCalendarPending, inspectCalendarEntry, isCalendarQuestionReply, isUsableCalendarReply, loadReplyReference, pendingConfirmationAction } from './calendar-entry.js';
 
 import { buttonFor } from './buttons.js';
 import { directCompletionTarget, requestedCompletionTitle, planNatural, planWithoutTarget } from './natural.js';
-import { runNaturalWorkflow } from './assistant/workflow.js';
+import { PendingCheckpointError, runNaturalWorkflow } from './assistant/workflow.js';
+import { errorFields, jobDebug, jobTrace } from './diagnostics.js';
 
 async function isPendingAnswer(job, text, previous, reference, button, now, loadTasks) {
   if (!previous?.pending || previous.actor !== String(job.payload.actor)
@@ -91,8 +92,19 @@ async function processButton(job, store, loadTasks, now, options) {
 }
 
 export async function processJob(job, store, ai, now = new Date(), signal, options = {}) {
+  const input = { job, store, now, signal, options };
+  const standalonePendingAction = !options.calendarEntry && !job.payload.button && pendingConfirmationAction(job.payload.text);
+  const entry = options.calendarEntry ?? (standalonePendingAction ? await inspectCalendarEntry(input) : null);
+  jobDebug('calendar.enter', { entry:entry?.kind });
+  if (entry?.kind === 'pending-show' || entry?.kind === 'pending-cancel') {
+    return finishCalendarPending(input, entry, { mode:entry.kind });
+  }
+  if (standalonePendingAction && entry?.kind === 'blocked') {
+    await options.authorize?.();
+    signal?.throwIfAborted();
+    return store.finishSkillRouting(job, entry.notice);
+  }
   const savedState=await store.conversation?.(job.payload.actor)||null;
-  const entry = options.calendarEntry;
   const liveState = liveCalendarState(savedState, job.payload.actor, now);
   const pendingState = liveState?.pending ? liveState : null;
   const verified = entry?.kind === 'verified-followup';
@@ -195,16 +207,25 @@ export async function processJob(job, store, ai, now = new Date(), signal, optio
           previous, reference, buttonInput, classification, resumedIntent, resumed:resume, verified,
           recentScope:recent ? entry : null
         })
+      }).catch(error => {
+        if (!(error instanceof PendingCheckpointError)) throw error;
+        jobDebug('calendar.checkpoint.restore.error', errorFields(error.cause ?? error));
+        return null;
       });
+      if (!result) {
+        return finishCalendarPending(input, { contextKey:calendarStateKey(previous),
+          replyId:scopedReply ? routedReference.messageId : null }, { mode:'checkpoint-unavailable' });
+      }
       ({reply, changes = [], settingsChange = null, refs = [], conversation = null, retrievalReply = null, button = null} = result);
       resumeToken = result.resumeToken;
       ({seriesRegistration, seriesCancellation} = result);
     }
   }
   if (guard?.preserve && conversation?.pending && (conversation.workflow || !changes.length && !settingsChange)) {
-    await options.authorize?.();
-    signal?.throwIfAborted();
-    return store.finishSkillRouting(job, calendarPendingNotice);
+    jobDebug('calendar.save.start', { outcome:'preserve-pending' });
+    const reply = await finishCalendarPending(input, entry);
+    jobDebug('calendar.save.done', { outcome:'preserve-pending' });
+    return reply;
   }
   if (retrievalReply&&settingsChange&&!changes.length)reply+='\n\n✅ 알림 설정 저장 완료\n\n'+settingsText(settingsChange.after);
   if (changes.length) reply = (retrievalReply?retrievalReply+'\n\n':'')+formatReceipt(changes)+(settingsChange?'\n알림 설정\n'+settingsText(settingsChange.after):'');
@@ -221,9 +242,15 @@ export async function processJob(job, store, ai, now = new Date(), signal, optio
   await options.authorize?.();
   if (entry) signal?.throwIfAborted();
   try {
+    jobDebug('calendar.save.start', { changes:changes.length, pending:!!conversation?.pending,
+      preservePending:!!guard?.preserve });
     const storedReply = await store.finish(job, changes, reply,settingsChange,{button,consumeButton:job.payload.button?.token,resumeToken,refs:refs.map(t=>({id:t.id,title:t.title})),conversation,expiresAt:new Date(now.getTime()+30*86400000).toISOString(),seriesCancellation,...seriesRegistration,...(guard && {calendarGuard:guard})});
+    const openedQuestion = !guard?.preserve && !!conversation?.pending;
+    jobDebug('calendar.save.done', { changes:changes.length, pending:openedQuestion,
+      question:openedQuestion && conversation.requestId ? jobTrace('calendar-question', conversation.requestId) : undefined });
     return seriesRegistration ? storedReply ?? reply : reply;
   } catch (cause) {
+    jobDebug('calendar.save.error', errorFields(cause));
     if (!seriesRegistration || cause.message.startsWith('확인 요청이 이미')) throw cause;
     throw new Error('반복 일정 저장 오류',{cause});
   }

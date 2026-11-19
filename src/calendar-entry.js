@@ -1,11 +1,22 @@
-import { calendarStateKey, conversationLifetimeMs, liveCalendarState, quickCommand, selectedDetail } from './context.js';
+import { calendarStateKey, conversationLifetimeMs, isPendingInChat, liveCalendarState, quickCommand, selectedDetail } from './context.js';
 import { directCompletionTarget, requestedCompletionTitle } from './natural.js';
 import { isActive } from './tasks.js';
 import { defaults } from './settings.js';
+import { jobDebug, jobTrace } from './diagnostics.js';
 
 export const calendarPendingNotice = '먼저 진행 중인 일정 확인 질문에 답해주세요. 확인이 끝나면 이 요청 전체를 다시 보내주세요.';
 const unclearReply = '이어갈 일정 확인 질문을 찾지 못했어요. 원래 질문에 필요한 답이나 새 요청 전체를 보내주세요.';
 export const calendarContextChanged = '확인 요청이 이미 처리됐거나 다른 요청으로 바뀌었어요. 새 요청을 알려주세요.';
+const noPendingQuestion = '이 채팅에 진행 중인 확인 질문이 없거나 이미 만료됐어요. 필요한 요청을 다시 보내주세요.';
+const pendingContextChanged = calendarContextChanged + ' 현재 질문을 보려면 “!무슨 질문이야?”를 새 메시지로 보내주세요.';
+const cancelPendingHelp = '이 확인을 종료하려면 “!기존 질문 취소해줘”를 보내주세요.';
+const pendingShow = /^(?:(?:무슨|어떤)(?:일정)?(?:확인질문|확인|질문)(?:이야|이에요|인가요|이었지|이지)?|(?:아까|이전|기존|진행중인|대기중인)?(?:일정확인질문|확인질문|질문)(?:을)?(?:다시)?(?:보여줘|보여주세요|알려줘|알려주세요))$/u;
+const pendingCancel = /^(?:(?:아까|이전|기존|진행중인|대기중인)(?:일정확인질문|일정확인|확인질문|확인|질문)|확인질문)(?:을|를)?취소(?:해줘|해주세요)?$/u;
+
+export function pendingConfirmationAction(text) {
+  const compact = text.normalize('NFKC').replace(/\s+/gu, '').replace(/[.!?。！？]+$/u, '');
+  return pendingShow.test(compact) ? 'pending-show' : pendingCancel.test(compact) ? 'pending-cancel' : null;
+}
 
 const day = '(?:오늘|어제|그제|내일|모레|(?:지난|이번|다음)\\s*주\\s*[월화수목금토일]요일|[월화수목금토일]요일|\\d{4}-\\d{2}-\\d{2}|\\d{1,2}/\\d{1,2}|(?:\\d{4}\\s*년\\s*)?(?:\\d{1,2}\\s*월\\s*)?\\d{1,2}\\s*일|말일)';
 const clock = '(?:(?:오전|오후|저녁|아침|밤)\\s*)?(?:\\d{1,2}:\\d{2}(?:분)?|(?:\\d{1,2}|한|두|세|네|다섯|여섯|일곱|여덟|아홉|열(?:한|두)?)\\s*시(?:\\s*(?:반|\\d{1,2}\\s*분))?|정오|자정)';
@@ -38,6 +49,61 @@ export function isCalendarQuestionReply(reference, pending, actor) {
   return !!pending && reference.pending && reference.ownerActor === String(actor)
     && reference.requestId === pending.requestId
     && (!pending.workflow || reference.workflowToken === pending.workflow.token);
+}
+
+export async function finishCalendarPending({ job, store, now, signal, options }, entry, {
+  mode = 'conflict', before = '', after = ''
+} = {}) {
+  const { actor, chatId } = job.payload;
+  const state = liveCalendarState(await store.conversation(actor), actor, now);
+  const reference = entry.replyId != null ? await loadReplyReference(job, store) : null;
+  const joinReply = message => [before, message, after].filter(Boolean).join('\n\n');
+  let reply = joinReply(mode === 'conflict' && state?.pending && !isPendingInChat(state, chatId)
+    ? '진행 중인 일정 확인은 질문이 시작된 채팅에서 답하거나 취소해주세요.'
+    : noPendingQuestion);
+  let calendarPending;
+  if (isPendingInChat(state, chatId) && calendarStateKey(state) === entry.contextKey
+      && (entry.replyId == null || reference?.messageId === entry.replyId && isUsableCalendarReply(reference, job.payload, now)
+        && isCalendarQuestionReply(reference, state, actor))) {
+    const cancel = mode === 'pending-cancel';
+    const question = typeof state.request?.question === 'string' ? state.request.question.trim() : '';
+    const refs = [];
+    if (cancel) {
+      reply = '진행 중인 확인 질문을 취소했어요. 필요한 신규 요청을 다시 보내주세요.';
+    } else {
+      const order = state.request?.candidateOrder ?? state.taskIds ?? [];
+      let choices = '';
+      if (question && order.length && !/(?:^|\n)\s*1[.)]\s/u.test(question)) {
+        const settings = options?.settings ?? defaults;
+        const tasks = await (store.calendarTasks?.({ now, timeZone:settings.timeZone, includeIds:order }) ?? store.tasks());
+        const byId = new Map(tasks.map(task => [task.id, task]));
+        choices = order.map((id, index) => {
+          const task = byId.get(id);
+          const version = state.workflow?.versions?.[id];
+          if (!task || version != null && task.version !== version) return `${index + 1}. 지금 확인할 수 없는 후보`;
+          refs.push({ id, title:task.title });
+          return `${index + 1}. ${task.title.replace(/[\r\n]+/g, ' ')} · ${task.dueDate ?? '날짜 미정'}${task.time ? ' ' + task.time : ''}`;
+        }).join('\n');
+      }
+      const heading = mode === 'conflict' ? calendarPendingNotice : '진행 중인 일정 확인 질문이에요.';
+      const instructions = mode === 'checkpoint-unavailable'
+        ? '저장된 확인 상태를 이어갈 수 없어요. 확인을 취소한 뒤 원래 요청을 다시 보내주세요.'
+        : question ? '이 질문에 필요한 답을 보내주세요.' : '저장된 질문 내용을 찾지 못했어요.';
+      reply = joinReply([heading, question, choices, instructions, cancelPendingHelp].filter(Boolean).join('\n\n'));
+    }
+    calendarPending = { expected:entry.contextKey, reference, cancel,
+      replyToQuestion:!cancel && !!question && mode !== 'checkpoint-unavailable', refs,
+      changedReply:joinReply(pendingContextChanged) };
+  } else if (entry.contextKey && isPendingInChat(state, chatId)) {
+    reply = joinReply(pendingContextChanged);
+  }
+  signal?.throwIfAborted();
+  await options?.authorize?.();
+  signal?.throwIfAborted();
+  jobDebug('calendar.pending.reply.start', { mode, matched:!!calendarPending });
+  const sentReply = await store.finishSkillRouting(job, reply, { calendarPending });
+  jobDebug('calendar.pending.reply.done', { mode, matched:!!calendarPending && sentReply === reply });
+  return sentReply;
 }
 
 function candidateAnswer(text, state, tasks) {
@@ -89,8 +155,20 @@ export async function inspectCalendarEntry({ job, store, now, options = {} }) {
   const sentAfterQuestion = !Number.isFinite(sentAt) || sentAt >= questionSecond;
   const linked = pending && sameChat && sentAfterQuestion
     && (!replyTo || validRef && isCalendarQuestionReply(reference, pending, actor));
+  const pendingAction = pendingConfirmationAction(text);
+  if (pendingAction) {
+    return linked ? { ...entry, kind:pendingAction, replyId:replyTo ? reference.messageId : null }
+      : { kind:'blocked', notice:pending && sameChat ? pendingContextChanged : noPendingQuestion };
+  }
+  if (pending) jobDebug('calendar.pending.inspect', {
+    question:pending.requestId ? jobTrace('calendar-question', pending.requestId) : undefined,
+    type:pending.request?.dateCompletion ? 'date-completion'
+      : pending.request?.seriesCancellation ? 'series-cancellation' : 'other',
+    ageSeconds:Math.floor(+now / 1000) - questionSecond,
+    hasCheckpoint:!!pending.workflow?.snapshot, linked:!!linked
+  });
   const readTasks = includeIds => store.calendarTasks?.({ now, timeZone:(options.settings ?? defaults).timeZone, includeIds }) ?? store.tasks();
-  if (pending && combinedSelection.test(text)) return { kind:'blocked', notice:calendarPendingNotice };
+  if (pending && combinedSelection.test(text)) return { ...entry, kind:'blocked', notice:calendarPendingNotice, showPending:sameChat };
   if (linked) {
     const ids = pending.taskIds ?? [];
     const fixedKind = pending.request?.dateCompletion || pending.request?.seriesCancellation;
@@ -109,7 +187,8 @@ export async function inspectCalendarEntry({ job, store, now, options = {} }) {
   }
   if (acknowledgement.test(text) || selection.test(text) || dateAnswer.test(answer) || timeAnswer.test(answer)
       || dateAndTime.test(answer) || seriesScope.test(answer)) {
-    return { kind:'blocked', notice:linked ? calendarPendingNotice : reference?.pending ? calendarContextChanged : unclearReply };
+    return { ...entry, kind:'blocked', showPending:!!linked,
+      notice:linked ? calendarPendingNotice : reference?.pending ? calendarContextChanged : unclearReply };
   }
   if ((read || change) && (dependent.test(text) || replyTo)) {
     return { kind:'blocked', notice:unclearReply };

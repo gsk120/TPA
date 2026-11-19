@@ -133,33 +133,36 @@ test('the 3-B entry separates new work from a linked question and preserves the 
     /진행 중인 일정 확인[\s\S]*메일 기능은 아직/);
   assert.match(await route(input(await enqueue(3,'월요일 가계부에서 식비가 얼마인지 알려줘'),noAi)), /가계부 기능은 아직/);
   assert.match(await route(input(await enqueue(4,'네, 어제 온 메일도 찾아줘',{replyTo}),noAi)), /진행 중인 일정 확인/);
-  await route(input(await enqueue(5,'병원 새 약속 추가',{replyTo}),proposal([create(newTask('병원'))])));
-  assert.match(await route(input(await enqueue(6,'전체 일정 보여줘'),noAi)), /병원/);
-  assert.match(await route(input(await enqueue(7,'병원 완료해줘'),noAi)), /완료/);
+  await route(input(await enqueue(5,'오늘 개인비서 테스트 추가',{replyTo}),proposal([create(newTask('개인비서 테스트'))])));
+  assert.match(await route(input(await enqueue(6,'전체 일정 보여줘'),noAi)), /개인비서 테스트/);
+  assert.match(await route(input(await enqueue(7,'개인비서 테스트 완료해줘'),noAi)), /완료/);
   assert.match(await route(input(await enqueue(8,'점심 일정 등록'),ask)), /진행 중인 일정 확인/);
   assert.deepEqual(await store.conversation(actor),pending);
-  const raw = (await db.query("select reply_to from assistant.context where text='병원 새 약속 추가'")).rows[0];
+  const raw = (await db.query("select reply_to from assistant.context where text='오늘 개인비서 테스트 추가'")).rows[0];
   assert.equal(raw.reply_to,replyTo);
   const other = await enqueue(9,'16:40',{actor:'2',replyTo});
   assert.match(await route(input(other,noAi)),/이미 처리/);
   const wrongChat = await enqueue(10,'16:40',{chatId:'-20',replyTo});
   assert.match(await route(input(wrongChat,noAi)),/이미 처리/);
-  await route(input(await enqueue(11,'오후 네 시',{replyTo}),{
+  await route(input(await enqueue(11,'오전 3시',{replyTo}),{
     ...noAi, answer:async ({pendingRequest}) => {
       assert.equal(pendingRequest.originalText,'차량 점검 등록');
-      return {actions:[create(newTask('차량 점검','16:00'))],reply:''};
+      return {actions:[create(newTask('차량 점검','03:00'))],reply:''};
     }
   }));
   assert.equal((await store.conversation(actor)).pending,false);
-  assert.deepEqual(routeCalls,['차량 점검 등록','오전 9시에 온 카드 결제 메일 찾아줘','월요일 가계부에서 식비가 얼마인지 알려줘','병원 새 약속 추가','점심 일정 등록']);
-  assert.equal((await store.tasks()).find(task => task.title === '차량 점검').time,'16:00');
+  assert.deepEqual(routeCalls,['차량 점검 등록','오전 9시에 온 카드 결제 메일 찾아줘','월요일 가계부에서 식비가 얼마인지 알려줘','오늘 개인비서 테스트 추가','점심 일정 등록']);
+  assert.equal((await store.tasks()).find(task => task.title === '차량 점검').time,'03:00');
 });
 
-test('3-B freezes a date approval across re-lease and rejects a replacement question at commit', async t => {
+test('saved Calendar approvals survive re-lease and still reject a replacement question at commit', async t => {
   const { db, store, actor, now, input, enqueue } = await harness(t);
   const route = createSkillRouter({
     skills:[createCalendarSkill()], inspectCalendar:inspectCalendarEntry,
-    classifySkill: async () => ({kind:'single',skills:['calendar']})
+    classifySkill: async text => {
+      assert.equal(text,'날짜별 일정 완료해줘');
+      return {kind:'single',skills:['calendar']};
+    }
   });
   const day = new Date(+now - 86400000).toISOString().slice(0,10);
   const task = {...taskFields,id:randomUUID(), version:1, title:'검토', kind:'task', status:'open', dueDate:day};
@@ -198,14 +201,19 @@ test('3-B freezes a date approval across re-lease and rejects a replacement ques
   const earlier = await enqueue(5,'네',{sentAt:Math.floor(+now / 1000) - 60});
   assert.match(await route(input(earlier)),/확인 질문을 찾지 못했어요/);
   const valid = await enqueue(6,'네');
-  assert.match(await route(input(valid)),/완료/);
+  await assert.rejects(crash(input(valid)), /simulated crash/);
+  const saved = await store.skillRoutingDecision(valid);
+  assert.equal(saved.version, 2);
+  assert.equal(saved.bypass, true);
+  await db.query("update assistant.jobs set lease_until=now()-interval '1 second' where id='tg:6'");
+  assert.match(await route(input(await store.claim('tg:6'))),/완료/);
   assert.equal(await store.ingest(6,valid.payload),false);
   assert.equal((await store.tasks())[0].status,'done');
   assert.equal((await store.history()).length,1);
 });
 
 test('the 3-B entry keeps recent follow-ups scoped and restores a saved selection button', async t => {
-  const { db, store, actor, input, enqueue } = await harness(t);
+  const { db, store, actor, now, input, enqueue } = await harness(t);
   const route = createSkillRouter({
     skills:[createCalendarSkill()], inspectCalendar:inspectCalendarEntry,
     classifySkill:async text => {
@@ -219,6 +227,7 @@ test('the 3-B entry keeps recent follow-ups scoped and restores a saved selectio
   for (const task of tasks) {
     await db.query('insert into assistant.tasks(family_id,id,version,data) values($1,$2,$3,$4)',[store.familyId,task.id,1,task]);
   }
+  assert.match(await route(input(await enqueue(10,'그거 취소해줘'))), /확인 질문을 찾지 못했어요/);
   const classify = async () => ({intent:'complete',targets:['사진 촬영'],answer:null});
   await route(input(await enqueue(1,'사진 촬영 완료해줘'),{classify}));
   const pending = await store.conversation(actor);
@@ -233,13 +242,26 @@ test('the 3-B entry keeps recent follow-ups scoped and restores a saved selectio
   assert.equal(state.pending,false);
   const target = (await store.tasks()).find(task => task.id === state.taskIds[0]);
   assert.equal(target.status,'done');
-  const recentJob = await enqueue(3,'그거 내일로 미뤄줘');
+  const recentJob = await enqueue(3,'그거 내일로 바꿔줘');
   const other = (await store.tasks()).find(task => task.id !== target.id);
   await assert.rejects(route(input(recentJob,{answer:async ({tasks:scoped}) => {
     assert.deepEqual(scoped.map(task => task.id),[target.id]);
     return {reply:'',actions:[{operation:'update',id:other.id,expectedVersion:other.version,task:other}]};
   }})),/후보 범위 밖/);
   assert.equal((await store.history()).length,1);
+  const tomorrow = new Date(+now + 86400000).toISOString().slice(0,10);
+  for (const [id,text,fields] of [
+    [4,'그거 내일로 바꿔줘',{dueDate:tomorrow}],
+    [5,'그거 취소해줘',{status:'cancelled'}]
+  ]) {
+    await route(input(await enqueue(id,text),{answer:async ({tasks:[task]}) => {
+      assert.equal(task.id,target.id);
+      return {reply:'',actions:[{operation:'update',id:task.id,expectedVersion:task.version,task:{...task,...fields}}]};
+    }}));
+    const updated = (await store.tasks()).find(task => task.id === target.id);
+    for (const [field,value] of Object.entries(fields)) assert.equal(updated[field],value);
+  }
+  assert.equal((await store.tasks()).find(task => task.id === other.id).status,'open');
 });
 
 test('a reclaimed Telegram job reuses its decision, can only finish once, and keeps metadata out of the Skill', async t => {

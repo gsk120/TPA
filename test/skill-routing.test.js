@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { Codex } from '../src/assistant/codex.js';
 import { skillRoutingPrompt, skillRoutingSchema, validateSkillRouting } from '../src/assistant/skill-routing.js';
+import { inspectCalendarEntry } from '../src/calendar-entry.js';
 import { createSkillRouter } from '../src/core/router.js';
 
 test('routing contract rejects malformed results and execution fields', () => {
@@ -34,6 +35,68 @@ test('Codex sends only a text data field and the routing schema, then validates 
   assert.throws(() => skillRoutingPrompt('a'.repeat(8001)), /길이/);
   ai.run = async () => '{broken';
   await assert.rejects(ai.classifySkill(request), { codexFailure: { stage: 'classifySkill', category: 'invalid-output' } });
+});
+
+test('Core 3-C routes or blocks the structured results from the development fixtures', async t => {
+  const fixture = JSON.parse(await readFile(new URL('./fixtures/skill-routing-core-3c.json', import.meta.url), 'utf8'));
+  const notices = { finance: /가계부 기능은 아직/, mail: /메일 기능은 아직/, photo: /사진 기능은 아직/ };
+  const cases = [
+    ...fixture.map(({id, text, expected}) => ({id, text, raw:JSON.stringify(expected), expected})),
+    { id:'ambiguous', text:'카드 건 찾아줘', raw:'{"kind":"ambiguous","skills":["finance","mail"]}',
+      expected:{kind:'ambiguous', skills:['finance','mail']} },
+    { id:'invalid-json', text:fixture[0].text, raw:'{broken' },
+    { id:'unknown-id', text:fixture[0].text, raw:'{"kind":"single","skills":["weather"]}' },
+    { id:'cli-failure', text:fixture[0].text }
+  ];
+  for (const { id, text, raw, expected } of cases) {
+    await t.test(id, async () => {
+      let saved = null;
+      let calls = 0;
+      let dispatched = 0;
+      const ai = new Codex({});
+      ai.run = async prompt => {
+        calls++;
+        assert.deepEqual(JSON.parse(prompt.split('\n').at(-1).slice('입력 JSON: '.length)), { text });
+        if (!raw) throw new Error('Codex unavailable');
+        return raw;
+      };
+      const route = createSkillRouter({
+        skills: [{ id:'calendar', handle: ({ job, options }) => {
+          dispatched++;
+          assert.equal(job.payload.text, text);
+          assert.equal(options.calendarEntry.kind, 'fresh');
+          return { message:'calendar' };
+        } }],
+        classifySkill: ai.classifySkill.bind(ai),
+        inspectCalendar: inspectCalendarEntry
+      });
+      const store = {
+        conversation: async () => null,
+        tasks: async () => [],
+        skillRoutingDecision: async () => saved,
+        saveSkillRoutingDecision: async (_, value) => (saved = value),
+        finishSkillRouting: async (_, message, options) => ({ message, ...options })
+      };
+      const result = await route({
+        job: { payload:{ actor:'1', chatId:'-10', text } }, store, now:new Date(),
+        options: { authorize:async () => {} }
+      });
+      const skill = expected?.skills[0];
+      const calendar = expected?.kind === 'single' && skill === 'calendar';
+      assert.equal(calls, 1);
+      assert.equal(dispatched, calendar ? 1 : 0);
+      assert.deepEqual(saved?.decision, expected);
+      if (calendar) assert.equal(result.message, 'calendar');
+      else if (!expected) assert.deepEqual(result, {
+        message:'요청을 담당할 기능을 확인하지 못했어요. 잠시 후 요청 전체를 다시 보내주세요.', failed:true
+      });
+      else {
+        assert.equal(result.failed, false);
+        assert.match(result.message, expected.kind === 'single' ? notices[skill]
+          : expected.kind === 'multiple' ? /여러 기능/ : /구체적으로/);
+      }
+    });
+  }
 });
 
 test('Codex routing transport bounds output and stops a timed-out child', { timeout: 8000 }, async t => {

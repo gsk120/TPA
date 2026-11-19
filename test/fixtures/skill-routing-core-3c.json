@@ -1,0 +1,23 @@
+[
+  {"id":"calendar-test-today","text":"오늘 개인비서 테스트 추가","expected":{"kind":"single","skills":["calendar"]}},
+  {"id":"calendar-lunch","text":"기석 점심 추가해줘","expected":{"kind":"single","skills":["calendar"]}},
+  {"id":"calendar-dated-lunch","text":"11월 20일 기석 점심 추가해줘","expected":{"kind":"single","skills":["calendar"]}},
+  {"id":"calendar-errand","text":"내일 장보기","expected":{"kind":"single","skills":["calendar"]}},
+  {"id":"calendar-vaccine","text":"내일 서아 예방접종","expected":{"kind":"single","skills":["calendar"]}},
+  {"id":"calendar-monthly-pay","text":"매월 21일 월급 추가","expected":{"kind":"single","skills":["calendar"]}},
+  {"id":"calendar-lunch-done","text":"기석 점심 완료해줘","expected":{"kind":"single","skills":["calendar"]}},
+  {"id":"calendar-dentist-done","text":"기석 치과 끝","expected":{"kind":"single","skills":["calendar"]}},
+  {"id":"calendar-reservation-history","text":"병원 예약한 거 언제였지?","expected":{"kind":"single","skills":["calendar"]}},
+  {"id":"calendar-photo-shoot","text":"사진 촬영 일정 잡아줘","expected":{"kind":"single","skills":["calendar"]}},
+  {"id":"calendar-card-due","text":"카드값 납부일 등록해줘","expected":{"kind":"single","skills":["calendar"]}},
+  {"id":"calendar-mail-todo","text":"메일 확인하는 거 내일 할 일로 넣어줘","expected":{"kind":"single","skills":["calendar"]}},
+  {"id":"photo-birthday-direct","text":"서아 생일사진 찾아줘","expected":{"kind":"single","skills":["photo"]}},
+  {"id":"photo-hospital","text":"서아 병원 다녀온 사진 찾아줘","expected":{"kind":"single","skills":["photo"]}},
+  {"id":"mail-daycare","text":"어제 어린이집에서 온 메일 내용 정리해줘","expected":{"kind":"single","skills":["mail"]}},
+  {"id":"mail-card-payment","text":"지난달 카드 결제 메일 찾아줘","expected":{"kind":"single","skills":["mail"]}},
+  {"id":"finance-card-spend","text":"이번 달 카드 사용액 알려줘","expected":{"kind":"single","skills":["finance"]}},
+  {"id":"finance-pay-date","text":"이번 달 월급 들어온 날짜 알려줘","expected":{"kind":"single","skills":["finance"]}},
+  {"id":"multiple-mail-calendar","text":"어린이집 안내 메일 찾아서 일정 등록해줘","expected":{"kind":"multiple","skills":["mail","calendar"]}},
+  {"id":"unknown-weather","text":"오늘 날씨 알려줘","expected":{"kind":"unknown","skills":[]}},
+  {"id":"unknown-translation","text":"영어로 번역해줘","expected":{"kind":"unknown","skills":[]}}
+]

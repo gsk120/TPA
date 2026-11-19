@@ -334,11 +334,17 @@ test('Codex classification supplies date scope schema and existing date policy i
   ai.run = async (prompt,schema,_signal,stage) => {
     assert.equal(stage,'classify');
     assert.equal(schema,intentSchema);
-    assert.ok(schema.required.includes('completion'));
+    assert.deepEqual(schema.required,['classification']);
+    const branches = schema.properties.classification.anyOf;
+    assert.ok(branches.every(branch => branch.required.includes('completion')));
+    const completionBranch = branches.find(branch => branch.properties.intent.enum.includes('complete'));
+    assert.deepEqual(completionBranch.properties.answer,{type:'null'});
+    const createBranch = branches.find(branch => branch.properties.intent.enum.includes('create'));
+    assert.equal(createBranch.properties.answer.type,'object');
     assert.ok(prompt.includes('11월 17일 일정 완료해줘'));
     assert.ok(prompt.includes('지난주 월요일'));
     assert.ok(prompt.includes('일정 날짜·시간 해석 정책'));
-    return JSON.stringify(completion());
+    return JSON.stringify({classification:completion()});
   };
-  await ai.classify({message:{text:'어제 일정 완료해줘'},now,settings:{timeZone}});
+  assert.deepEqual(await ai.classify({message:{text:'어제 일정 완료해줘'},now,settings:{timeZone}}),completion());
 });

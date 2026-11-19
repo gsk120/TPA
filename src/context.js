@@ -19,6 +19,11 @@ export function calendarStateKey(state) {
   return state ? JSON.stringify([state.requestId, state.workflow?.token ?? null, state.expiresAt]) : null;
 }
 
+export function isPendingInChat(state, chatId) {
+  const stateChat = state?.workflow?.chatId ?? state?.chatId;
+  return !!state?.pending && (stateChat == null || stateChat === String(chatId));
+}
+
 export const conversationLifetimeMs = 2 * 3600000;
 export const settingsIntent=text=>/(?:점검|알림|시간대|타임존)/.test(text)&&/(?:매일|매주|주간|일일|중지|재개|설정|시간대|타임존)/.test(text);
 const stops=new Set(['일정','과업','할일','목록','오늘','내일','모레','이번주','다음주','지난주','전체','모두','관련','언제','왜','뭐','뭐야','그거','그건','그걸','그것','알려줘','보여줘','조회','찾아줘','해주세요','해줘','추가','추가해줘','등록','등록해줘','예약','변경','변경해줘','미뤄줘','바꿔줘','완료','완료했어','완료해줘','취소','취소해줘','끝','했어','지난','작년','올해','다음','현재','준비','오전','오후','까지','결정','날짜','시간']);

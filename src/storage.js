@@ -5,7 +5,8 @@ import { randomUUID, createHash } from 'node:crypto';
 import { applyOccurrenceChange, createScheduleSeries, hasScheduleSchema, linkScheduleOccurrence, lockRegistrationSeries, readActiveScheduleSeries, readCalendarTasks, updateScheduleSeries } from './schedule-store.js';
 import { occurrenceId } from './recurrence.js';
 import { addScheduleBackup, restoreFamilyBackup } from './schedule-backup.js';
-import { calendarStateKey, liveCalendarState } from './context.js';
+import { calendarStateKey, isPendingInChat, liveCalendarState } from './context.js';
+import { jobDebug } from './diagnostics.js';
 
 export class Store {
   constructor(pool, familyId) { this.pool = pool; this.familyId = familyId; }
@@ -50,6 +51,7 @@ export class Store {
   async close() { if (this.lock) { await this.lock.query('select pg_advisory_unlock_all()').catch(() => {}); this.lock.release(); } await this.pool.end(); }
   async tasks() { return (await this.pool.query('select data from assistant.tasks where family_id=$1 order by id', [this.familyId])).rows.map(r => r.data); }
   async calendarTasks(options) {
+    jobDebug('db.calendar-tasks.read');
     if (!await hasScheduleSchema(this.pool)) return this.tasks();
     return this.tx(async c => {
       await c.query('set transaction isolation level repeatable read read only');
@@ -85,7 +87,10 @@ export class Store {
   }
   async context() { return (await this.pool.query('select actor,text,reply_to,at from assistant.context where family_id=$1 order by id desc limit 20', [this.familyId])).rows.reverse(); }
   async runtimeValue(key){return (await this.pool.query('select value from assistant.runtime where family_id=$1 and key=$2',[this.familyId,key])).rows[0]?.value||null;}
-  async conversation(actor){return this.runtimeValue('conversation:'+String(actor));}
+  async conversation(actor){
+    jobDebug('db.conversation.read');
+    return this.runtimeValue('conversation:'+String(actor));
+  }
   async replyReference(id){if(!Number.isSafeInteger(Number(id)))return null;const value=await this.runtimeValue('message:'+(Number(id)%1000));return value?.messageId===Number(id)?value:null;}
   async referencesForDelivery(d){return d.result?.context||null;}
   async relatedHistory(ids,limit=8){
@@ -144,14 +149,35 @@ export class Store {
     if (!rows.length) throw new Error('작업 실행 권한이 만료됐습니다.');
     return rows[0].decision;
   }
-  async finishSkillRouting(job, reply, { failed = false } = {}) {
+  async finishSkillRouting(job, reply, { failed = false, calendarPending } = {}) {
     return this.tx(async c => {
       const { rowCount } = await c.query(
         "update assistant.jobs set status=$4,error=$5,finished_at=now() where family_id=$1 and id=$2 and lease=$3 and status='running' and lease_until>now()",
         [this.familyId, job.id, job.lease, failed ? 'failed' : 'done', failed ? reply : null]
       );
       if (!rowCount) throw new Error('작업 실행 권한이 만료됐습니다.');
-      await this.enqueue(c, (failed ? 'error:' : 'reply:') + job.id, reply);
+      let context;
+      if (calendarPending) {
+        const { actor, chatId } = job.payload;
+        const key = [this.familyId, 'conversation:' + String(actor)];
+        const {rows:[row]} = await c.query('select value, clock_timestamp() as checked_at from assistant.runtime where family_id=$1 and key=$2 for update', key);
+        const state = liveCalendarState(row?.value, actor, row?.checked_at);
+        const { expected, reference, cancel, replyToQuestion, refs, changedReply } = calendarPending;
+        let matches = isPendingInChat(state, chatId) && calendarStateKey(state) === expected;
+        if (matches && reference) {
+          const {rows:[current]} = await c.query('select value, clock_timestamp() as checked_at from assistant.runtime where family_id=$1 and key=$2 for share',
+            [this.familyId, 'message:' + (reference.messageId % 1000)]);
+          matches = isDeepStrictEqual(current?.value, reference) && Date.parse(reference.expiresAt) > +current?.checked_at;
+        }
+        if (!matches) reply = changedReply;
+        else if (cancel) await c.query("update assistant.runtime set value='null'::jsonb where family_id=$1 and key=$2", key);
+        else if (replyToQuestion) context = { refs, ownerActor:String(actor), pending:true,
+          requestId:state.requestId, workflowToken:state.workflow?.token };
+      }
+      const deliveryId = (failed ? 'error:' : 'reply:') + job.id;
+      await this.enqueue(c, deliveryId, reply);
+      if (context) await c.query('update assistant.deliveries set result=$3 where family_id=$1 and id=$2',
+        [this.familyId, deliveryId, {context}]);
       return reply;
     });
   }
@@ -258,7 +284,7 @@ export class Store {
     });
   }
   async fail(job, text, {silent = false, weeklySave = false} = {}) {
-    await this.tx(async c => {
+    const recorded = await this.tx(async c => {
       const r = await c.query("update assistant.jobs set status='failed',error=$4,finished_at=now() where family_id=$1 and id=$2 and lease=$3 and status='running' and lease_until>now()", [this.familyId, job.id, job.lease, text]);
       if (r.rowCount && !silent) {
         // An uncertain COMMIT can only be reported as a rollback if this job is still running.
@@ -266,7 +292,9 @@ export class Store {
           : /Codex|CLI|doctor/.test(text) ? 'AI 연결이나 응답에 문제가 있어요. 잠시 후 다시 요청해주세요.' : text;
         await this.enqueue(c, 'error:' + job.id, '⚠️ 처리를 완료하지 못했어요\n\n' + reason + '\n\n문제를 해결한 뒤 같은 내용을 다시 보내주세요.');
       }
+      return !!r.rowCount;
     });
+    jobDebug('worker.failure_save.done', { recorded, errorQueued:recorded && !silent });
   }
   async enqueue(c, id, text, task = null) {
     if (id.startsWith('series-reminder:')) {
