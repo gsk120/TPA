@@ -22,6 +22,10 @@ function isCompletionRequest(text) {
     && !/(?:추가|등록|완료\s*(?:취소|해제)|되돌려|되돌리기)/u.test(text);
 }
 
+function isUpdateRequest(text) {
+  return /(?:변경|수정|연기)(?:\s*(?:해|하|할|부탁)|[.!?\s]*$)|바꿔|바꾸|미뤄|미루|옮겨|옮기|앞당겨|앞당기|메모\s*(?:추가|남겨)/u.test(text);
+}
+
 
 function targetHints(text, now, timeZone) {
   const iso = text.match(/(?<!\d)(\d{4}-\d{2}-\d{2})(?!\d)/u);
@@ -253,7 +257,11 @@ export async function planNatural({job, store, ai, now, signal, options, current
   const existingTarget = ['update','complete','cancel','mixed'].includes(intent);
   const completion = resumed ? false : intent && intent !== 'existing'
     ? intent === 'complete' : isCompletionRequest(originalText);
-  let activeTasks = completion ? tasks.filter(isActive) : tasks;
+  const requestText = (resumed || verified || buttonInput) ? previous?.request?.originalText ?? originalText : originalText;
+  const updating = !recentScope?.read && (intent === 'update'
+    || ((!intent || intent === 'existing' || intent === 'mixed') && !cancelOccurrence
+      && !settingsIntent(requestText) && isUpdateRequest(requestText)));
+  let activeTasks = completion || updating ? tasks.filter(isActive) : tasks;
   if (occurrence) {
     const request = pendingSeries ? previous.request : null;
     const targetText = classification.targets.reduce((text, title) => text.replace(title, ' '), originalText);
@@ -282,11 +290,12 @@ export async function planNatural({job, store, ai, now, signal, options, current
     selection.context = previous.turns || [];
   } else if ((resumed || verified) && !buttonInput && !selection.continuation) {
     Object.assign(selection, {
-      candidates: tasks.filter(t => previous.taskIds.includes(t.id)),
+      candidates: (updating ? activeTasks : tasks).filter(t => previous.taskIds.includes(t.id)),
       continuation:true, request:previous.request, blocked:null,
       context:previous.turns || [], coverage:{scope:'followup', familyTaskCount:tasks.length}
     });
   }
+  if (updating) selection.coverage.familyTaskCount = tasks.length;
   if (recentScope) {
     if (new Set(selection.candidates.map(task => task.id)).size !== recentScope.targetIds.length) {
       return {reply:'❓ 이어갈 일정을 확인하지 못했어요. 일정 제목을 포함해 다시 요청해주세요.'};
@@ -308,7 +317,7 @@ export async function planNatural({job, store, ai, now, signal, options, current
   if (dateReply) {
     const filter = targetHints(originalText, now, current.timeZone);
     const candidates = tasks.filter(t => previous.taskIds.includes(t.id)
-      && (!isCompletionRequest(previous.request.originalText) || isActive(t)));
+      && (!(updating || isCompletionRequest(previous.request.originalText)) || isActive(t)));
     Object.assign(selection, {
       candidates: candidates.filter(filter), continuation:true, request:previous.request, blocked:null, context:[],
       coverage:{scope:'target-date', familyTaskCount:tasks.length}
@@ -325,6 +334,9 @@ export async function planNatural({job, store, ai, now, signal, options, current
   }
   const completing = completion || resumedIntent === 'complete'
     || (selection.continuation && isCompletionRequest(selection.request?.originalText || ''));
+  if (updating && buttonInput && !isActive(buttonInput.task)) {
+    throw new Error('선택한 일정이 이미 완료됐거나 취소됐어요.');
+  }
   if (completing && selection.candidates.some(t => !isActive(t))) {
     if (buttonInput) throw new Error('선택한 일정이 이미 완료됐거나 취소됐어요.');
     selection.blocked = '이전 후보에 이미 완료됐거나 취소된 일정이 있어요. 완료할 일정 제목을 다시 알려주세요.';
@@ -332,6 +344,9 @@ export async function planNatural({job, store, ai, now, signal, options, current
   }
   if (completing && !dateReply && !selection.candidates.length && !selection.blocked) {
     selection.blocked = '완료할 미완료 일정을 찾지 못했어요. 일정 제목이나 날짜를 확인해주세요.';
+  }
+  if (updating && !dateReply && !selection.candidates.length && !selection.blocked) {
+    selection.blocked = '변경할 미완료 일정을 찾지 못했어요. 일정 제목이나 날짜를 확인해주세요.';
   }
   let clarification=null;
   refs=selection.candidates;
@@ -341,7 +356,7 @@ export async function planNatural({job, store, ai, now, signal, options, current
   let chooseByDate = false;
   if (((occurrence && !selection.blocked || (exactScope && !exactScope.all)) && refs.length > 1) || (dateReply && refs.length !== 1)) {
     if (dateReply && !refs.length) {
-      refs = tasks.filter(t => previous.taskIds.includes(t.id) && (!completing || isActive(t)));
+      refs = tasks.filter(t => previous.taskIds.includes(t.id) && (!(completing || updating) || isActive(t)));
       reply = '❓ 그 날짜나 시각에 해당하는 일정을 찾지 못했어요. 원래 일정의 날짜나 시각을 다시 알려주세요.';
     } else if (refs.length <= 3 && new Set(refs.map(choiceLabel)).size === refs.length) {
       refs = [...refs].sort((a,b) => choiceLabel(a).localeCompare(choiceLabel(b)));
@@ -415,7 +430,7 @@ export async function planNatural({job, store, ai, now, signal, options, current
           || (completing && answer.actions[0].task.status !== 'done'))) {
         throw new Error('선택한 일정에 원래 요청을 적용하지 못했어요. 제목과 변경 내용을 다시 알려주세요.');
       }
-      const named = activeTasks.filter(t => t.title && intentText.includes(t.title));
+      const named = (updating ? tasks : activeTasks).filter(t => t.title && intentText.includes(t.title));
       const distinctNames = named.filter(t => !named.some(other => other.title !== t.title && other.title.includes(t.title)));
       const scopes = buttonInput ? [] : completionScopes(intentText, activeTasks);
       const completionCount = scopes.length;

@@ -242,17 +242,25 @@ test('the 3-B entry keeps recent follow-ups scoped and restores a saved selectio
   assert.equal(state.pending,false);
   const target = (await store.tasks()).find(task => task.id === state.taskIds[0]);
   assert.equal(target.status,'done');
-  const recentJob = await enqueue(3,'그거 내일로 바꿔줘');
   const other = (await store.tasks()).find(task => task.id !== target.id);
+  assert.match(await route(input(await enqueue(3,'그거 내일로 바꿔줘'),{
+    answer:async () => assert.fail('completed target must not reach the planner')
+  })),/이어갈 일정을 확인하지 못했어요/);
+  assert.equal((await store.history()).length,1);
+
+  const {rows:[undo]} = await db.query("select key from assistant.runtime where key like 'button:%' and value->>'kind'='undo'");
+  await route(input(await enqueue(4,'변경 되돌리기',{button:{token:undo.key.slice(7),index:0,messageId:89}})));
+  assert.equal((await store.tasks()).find(task => task.id === target.id).status,'open');
+  const recentJob = await enqueue(5,'그거 내일로 바꿔줘');
   await assert.rejects(route(input(recentJob,{answer:async ({tasks:scoped}) => {
     assert.deepEqual(scoped.map(task => task.id),[target.id]);
     return {reply:'',actions:[{operation:'update',id:other.id,expectedVersion:other.version,task:other}]};
   }})),/후보 범위 밖/);
-  assert.equal((await store.history()).length,1);
+  assert.equal((await store.history()).length,2);
   const tomorrow = new Date(+now + 86400000).toISOString().slice(0,10);
   for (const [id,text,fields] of [
-    [4,'그거 내일로 바꿔줘',{dueDate:tomorrow}],
-    [5,'그거 취소해줘',{status:'cancelled'}]
+    [6,'그거 내일로 바꿔줘',{dueDate:tomorrow}],
+    [7,'그거 취소해줘',{status:'cancelled'}]
   ]) {
     await route(input(await enqueue(id,text),{answer:async ({tasks:[task]}) => {
       assert.equal(task.id,target.id);

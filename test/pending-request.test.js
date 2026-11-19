@@ -72,6 +72,43 @@ test('completion searches only active tasks while completed items remain queryab
  assert.match(h.saved[1].reply,/2026년 11월 5일/);
 });
 
+test('rescheduling searches only active items with the requested title', async () => {
+ const title = '개인비서 테스트';
+ const active = {...place,title,status:'waiting',dueDate:'2026-11-06'};
+ const completed = {...snap,title,status:'done',dueDate:'2026-11-05'};
+ const cancelled = {...snap,id:'cancelled',title,status:'cancelled',dueDate:'2026-11-07'};
+ const h = harness();
+ let tasks = [completed,active,cancelled];
+ const store = {...h.store,tasks:async()=>tasks};
+ const job = {payload:payload(title+' 내일로 미뤄줘')};
+ const classify = async () => ({intent:'update',targets:[title],answer:null});
+ await processJob(job,store,{classify,answer:async input=>{
+   assert.deepEqual(input.tasks.map(task=>task.id),[active.id]);
+   return {actions:[update(input.tasks[0])]};
+ }},now);
+ assert.deepEqual(h.saved[0].changes.map(change=>change.after.id),[active.id]);
+ tasks = [completed,cancelled];
+ await processJob(job,store,{classify,answer:async()=>assert.fail('no active target')},now);
+ assert.match(h.saved[1].reply,/변경할 미완료 일정/);
+ assert.deepEqual(h.saved[1].changes,[]);
+});
+
+test('date selection rechecks that an earlier rescheduling candidate is active', async () => {
+ const title = '개인비서 테스트';
+ const h = harness();
+ let tasks = [{...snap,title,dueDate:'2026-11-05'},{...place,title,dueDate:'2026-11-06'}];
+ const store = {...h.store,tasks:async()=>tasks};
+ const classify = async () => ({intent:'update',targets:[title],answer:null});
+ const answer = async () => assert.fail('no date-selected active target');
+ await processJob({payload:payload(title+' 내일로 미뤄줘')},store,{classify,answer},now);
+ assert.deepEqual(h.state.taskIds.sort(),[snap.id,place.id].sort());
+ tasks = [{...tasks[0],status:'done',version:2},tasks[1]];
+ await processJob({payload:payload('11월 5일 거')},store,{answer},new Date(+now+60000));
+ assert.match(h.saved[1].reply,/그 날짜나 시각에 해당하는 일정을 찾지 못했어요/);
+ assert.deepEqual(h.saved[1].changes,[]);
+ assert.deepEqual(h.state.taskIds,[place.id]);
+});
+
 
 test('same-title candidates produce capped controls before calling Codex',async()=>{
  for(const count of [2,3,4,13]){

@@ -78,10 +78,12 @@ test('AI receives selected full fields and summary history, cannot edit unseen t
  await assert.rejects(processJob({payload:message('가상인물A 불소도포 변경해줘')},s,bad,now),/후보 범위/);
 });
 
-test('read-only questions cannot mutate and missing edit targets cannot become new tasks',async()=>{
+test('read-only questions cannot mutate and missing edit targets stop before planning',async()=>{
  const create={operation:'create',id:null,expectedVersion:null,task:a,reason:'wrong'};
  await assert.rejects(processJob({payload:message('가상인물A 불소도포 언제야 알려줘')},store(),{answer:async()=>({reply:'',actions:[create]})},now),/조회 요청/);
- await assert.rejects(processJob({payload:message('없는일정 내일로 변경해줘')},store(),{answer:async()=>({reply:'',actions:[create]})},now),/신규 추가/);
+ const reply = await processJob({payload:message('없는일정 내일로 변경해줘')},store(),
+   {answer:async()=>assert.fail('missing edit target must stop before planning')},now);
+ assert.match(reply,/변경할 미완료 일정/);
 });
 
 test('reply to a task clarification without repeating title retains same-user candidate',()=>{
