@@ -4,12 +4,14 @@ import { listTasks, briefing } from './briefing.js';
 import { addDays, dueBriefs, kst, today } from './time.js';
 import {defaults,settingsText} from './settings.js';
 import {quickCommand,nextConversation,detailQuery,detailCandidates,selectedDetail,followup,searchTerms,liveCalendarState,calendarStateKey} from './context.js';
-import { calendarContextChanged, finishCalendarPending, inspectCalendarEntry, isCalendarQuestionReply, isUsableCalendarReply, loadReplyReference, pendingConfirmationAction } from './calendar-entry.js';
+import { calendarContextChanged, planCalendarPending, inspectCalendarEntry, isCalendarQuestionReply, isUsableCalendarReply, loadReplyReference, pendingConfirmationAction } from './calendar-entry.js';
 
 import { buttonFor } from './buttons.js';
 import { directCompletionTarget, requestedCompletionTitle, planNatural, planWithoutTarget } from './natural.js';
 import { PendingCheckpointError, runNaturalWorkflow } from './assistant/workflow.js';
-import { errorFields, jobDebug, jobTrace } from './diagnostics.js';
+import { errorFields, jobDebug } from './diagnostics.js';
+import { calendarResult, completeSkillResult } from './core/complete.js';
+import { textResult } from './core/skill.js';
 
 async function isPendingAnswer(job, text, previous, reference, button, now, loadTasks) {
   if (!previous?.pending || previous.actor !== String(job.payload.actor)
@@ -86,23 +88,19 @@ async function processButton(job, store, loadTasks, now, options) {
     before:action.settings.after, after:action.settings.before, version:action.settings.version + 1
   };
   const reply = '↩️ 변경을 되돌렸어요.\n\n' + changes.map(c => '• ' + c.after.title).join('\n');
-  await options.authorize?.();
-  await store.finish(job, changes, reply, settings, {consumeButton:token, refs:changes.map(c => c.after)});
-  return {reply};
+  return { result:calendarResult(reply, changes, settings, {consumeButton:token, refs:changes.map(c => c.after)}) };
 }
 
-export async function processJob(job, store, ai, now = new Date(), signal, options = {}) {
+export async function planCalendarJob(job, store, ai, now = new Date(), signal, options = {}) {
   const input = { job, store, now, signal, options };
   const standalonePendingAction = !options.calendarEntry && !job.payload.button && pendingConfirmationAction(job.payload.text);
   const entry = options.calendarEntry ?? (standalonePendingAction ? await inspectCalendarEntry(input) : null);
   jobDebug('calendar.enter', { entry:entry?.kind });
   if (entry?.kind === 'pending-show' || entry?.kind === 'pending-cancel') {
-    return finishCalendarPending(input, entry, { mode:entry.kind });
+    return planCalendarPending(input, entry, { mode:entry.kind });
   }
   if (standalonePendingAction && entry?.kind === 'blocked') {
-    await options.authorize?.();
-    signal?.throwIfAborted();
-    return store.finishSkillRouting(job, entry.notice);
+    return textResult(entry.notice);
   }
   const savedState=await store.conversation?.(job.payload.actor)||null;
   const liveState = liveCalendarState(savedState, job.payload.actor, now);
@@ -139,7 +137,7 @@ export async function processJob(job, store, ai, now = new Date(), signal, optio
   const loadTasks = range => range
     ? readTasks({from:range.from,to:range.to,timeZone:range.timeZone ?? current.timeZone,includeIds:[],listOnly:true}) : tasks ??= readTasks();
   const buttonInput = job.payload.button ? await processButton(job, store, includeIds => readTasks({includeIds}), now, options) : null;
-  if (buttonInput?.reply) return buttonInput.reply;
+  if (buttonInput?.result) return buttonInput.result;
   const originalText = buttonInput?.action.text ?? job.payload.text.trim();
   if (entry?.target) {
     const currentTasks = await loadTasks();
@@ -213,7 +211,7 @@ export async function processJob(job, store, ai, now = new Date(), signal, optio
         return null;
       });
       if (!result) {
-        return finishCalendarPending(input, { contextKey:calendarStateKey(previous),
+        return planCalendarPending(input, { contextKey:calendarStateKey(previous),
           replyId:scopedReply ? routedReference.messageId : null }, { mode:'checkpoint-unavailable' });
       }
       ({reply, changes = [], settingsChange = null, refs = [], conversation = null, retrievalReply = null, button = null} = result);
@@ -222,10 +220,7 @@ export async function processJob(job, store, ai, now = new Date(), signal, optio
     }
   }
   if (guard?.preserve && conversation?.pending && (conversation.workflow || !changes.length && !settingsChange)) {
-    jobDebug('calendar.save.start', { outcome:'preserve-pending' });
-    const reply = await finishCalendarPending(input, entry);
-    jobDebug('calendar.save.done', { outcome:'preserve-pending' });
-    return reply;
+    return planCalendarPending(input, entry);
   }
   if (retrievalReply&&settingsChange&&!changes.length)reply+='\n\n✅ 알림 설정 저장 완료\n\n'+settingsText(settingsChange.after);
   if (changes.length) reply = (retrievalReply?retrievalReply+'\n\n':'')+formatReceipt(changes)+(settingsChange?'\n알림 설정\n'+settingsText(settingsChange.after):'');
@@ -239,21 +234,17 @@ export async function processJob(job, store, ai, now = new Date(), signal, optio
   if (changes.some(c => c.before)) {
     button = buttonFor(job, now, {kind:'undo', changes, settings:settingsChange}, ['↩️ 방금 변경 되돌리기']);
   }
-  await options.authorize?.();
-  if (entry) signal?.throwIfAborted();
-  try {
-    jobDebug('calendar.save.start', { changes:changes.length, pending:!!conversation?.pending,
-      preservePending:!!guard?.preserve });
-    const storedReply = await store.finish(job, changes, reply,settingsChange,{button,consumeButton:job.payload.button?.token,resumeToken,refs:refs.map(t=>({id:t.id,title:t.title})),conversation,expiresAt:new Date(now.getTime()+30*86400000).toISOString(),seriesCancellation,...seriesRegistration,...(guard && {calendarGuard:guard})});
-    const openedQuestion = !guard?.preserve && !!conversation?.pending;
-    jobDebug('calendar.save.done', { changes:changes.length, pending:openedQuestion,
-      question:openedQuestion && conversation.requestId ? jobTrace('calendar-question', conversation.requestId) : undefined });
-    return seriesRegistration ? storedReply ?? reply : reply;
-  } catch (cause) {
-    jobDebug('calendar.save.error', errorFields(cause));
-    if (!seriesRegistration || cause.message.startsWith('확인 요청이 이미')) throw cause;
-    throw new Error('반복 일정 저장 오류',{cause});
-  }
+  return calendarResult(reply, changes, settingsChange, {
+    button, consumeButton:job.payload.button?.token, resumeToken, refs:refs.map(t=>({id:t.id,title:t.title})),
+    conversation, expiresAt:new Date(now.getTime()+30*86400000).toISOString(),
+    seriesCancellation, ...seriesRegistration, ...(guard && {calendarGuard:guard})
+  });
+}
+
+// Direct Calendar callers share the same commit path as the routed worker.
+export async function processJob(job, store, ai, now = new Date(), signal, options = {}) {
+  const result = await planCalendarJob(job, store, ai, now, signal, options);
+  return completeSkillResult({ job, store, now, signal, options }, result, 'calendar');
 }
 
 export async function schedule(store, now = new Date(), settings = defaults, settingsVersion = null) {

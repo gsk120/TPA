@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { Store } from './storage.js';
+import { Store, recoverDeliveries } from './storage.js';
 import { validateSettings } from './settings.js';
 export const memberActive=m=>['creator','administrator','member'].includes(m?.status)||(m?.status==='restricted'&&m.is_member===true);
 export async function verifyMember(tg,chatId,userId){const m=await tg.call('getChatMember',{chat_id:chatId,user_id:Number(userId)});if(!memberActive(m))throw new Error('권한 확인: 현재 그룹 구성원이 아니에요.');return m;}
@@ -27,7 +27,7 @@ export class Families {
   this.lockClient=await this.pool.connect();const r=await this.lockClient.query('select pg_try_advisory_lock(hashtextextended($1,0)) as locked',['tobi:bot:'+this.botId]);
   if(!r.rows[0].locked){this.lockClient.release();this.lockClient=null;throw Object.assign(new Error('동일한 토비 봇이 이미 실행 중입니다.'), {code:'BOT_ALREADY_RUNNING'});}
   this.lockClient.on('error',()=>{console.error('Supabase 운영 잠금 연결이 끊겨 토비를 종료합니다.');process.exit(1);});
-  await this.pool.query("update assistant.deliveries set status='uncertain' where status='sending'");
+  await recoverDeliveries(this.pool);
  }
  async close(){if(this.lockClient){await this.lockClient.query('select pg_advisory_unlock_all()').catch(()=>{});this.lockClient.release();}await this.pool.end();}
 }

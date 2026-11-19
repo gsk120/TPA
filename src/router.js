@@ -25,11 +25,12 @@ export async function routeUpdate(u,families,tg,bot){
      } else {
        const undo = action.kind === 'undo';
        const index = Number(match[2]);
-       if (undo ? index === 0 : action.kind === 'select' && action.targets[index]) {
+       const skillChoice = action.kind === 'skill-choice' && typeof action.choices?.[index] === 'string';
+       if (undo ? index === 0 : skillChoice || action.kind === 'select' && action.targets[index]) {
          // The worker checks live Telegram membership before applying any change.
          const queued = await store.ingest(u.update_id, {
            actor: String(callback.from.id), chatId: String(m.chat.id),
-           text: undo ? '방금 변경 되돌리기' : '일정 대상 선택',
+           text: undo ? '방금 변경 되돌리기' : skillChoice ? '선택 메뉴 응답' : '일정 대상 선택',
            button: { token: match[1], index, messageId: m.message_id }
          });
          notice = queued ? null : 'duplicate';

@@ -3,7 +3,8 @@ import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import { PGlite } from '@electric-sql/pglite';
-import { createSkillRouter } from '../src/core/router.js';
+import { createJobDispatcher, createSkillRouter } from '../src/core/router.js';
+import { textResult } from '../src/core/skill.js';
 import { createCalendarSkill, inspectCalendarEntry } from '../src/skills/calendar.js';
 import { Store } from '../src/storage.js';
 
@@ -42,7 +43,7 @@ test('notice-only routing preserves a persisted Calendar checkpoint and trusted 
   const dueDate = new Date(+now + 2 * 86400000).toISOString().slice(0, 10);
   const calendar = createCalendarSkill();
   const question = await enqueue(1, '차량 점검 일정 추가');
-  await calendar.handle(input(question, { classify: async () => ({
+  await createJobDispatcher([calendar], 'calendar')(input(question, { classify: async () => ({
     intent: 'create', targets: [], answer: {
       reply: '', actions: [], clarification: {
         operation: 'create', candidateIds: [], question: '몇 시에 점검하나요?', unresolved: '시각',
@@ -293,9 +294,9 @@ test('a reclaimed Telegram job reuses its decision, can only finish once, and ke
   assert.notEqual(retry.lease, job.lease);
   await assert.rejects(store.finishSkillRouting(job, 'stale'), /만료/);
   const recovered = createSkillRouter({
-    skills: [{ id: 'calendar', handle: ({ job, store }) => {
+    skills: [{ id: 'calendar', handle: ({ job }) => {
       assert.equal(Object.hasOwn(job.payload, '_skillRouting'), false);
-      return store.finish(job, [], '일정 요청 처리');
+      return textResult('일정 요청 처리');
     } }],
     classifySkill: () => assert.fail('existing valid decision should be reused')
   });

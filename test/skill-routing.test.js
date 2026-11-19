@@ -7,6 +7,7 @@ import { Codex } from '../src/assistant/codex.js';
 import { skillRoutingPrompt, skillRoutingSchema, validateSkillRouting } from '../src/assistant/skill-routing.js';
 import { inspectCalendarEntry } from '../src/calendar-entry.js';
 import { createSkillRouter } from '../src/core/router.js';
+import { textResult } from '../src/core/skill.js';
 
 test('routing contract rejects malformed results and execution fields', () => {
   for (const value of [
@@ -65,7 +66,7 @@ test('Core 3-C routes or blocks the structured results from the development fixt
           dispatched++;
           assert.equal(job.payload.text, text);
           assert.equal(options.calendarEntry.kind, 'fresh');
-          return { message:'calendar' };
+          return textResult('calendar');
         } }],
         classifySkill: ai.classifySkill.bind(ai),
         inspectCalendar: inspectCalendarEntry
@@ -125,16 +126,17 @@ test('Codex routing transport bounds output and stops a timed-out child', { time
 
 test('only trusted Calendar entries, buttons and exact commands bypass the classifier', async () => {
   const route = createSkillRouter({
-    skills: [{ id: 'calendar', handle: input => input.job.payload.text }],
+    skills: [{ id: 'calendar', handle: input => textResult(input.job.payload.text) }],
     classifySkill: () => assert.fail('unexpected routing call')
   });
   const options = { authorize: async () => {} };
+  const store = { finishSkillRouting: async (_, reply) => reply };
   for (const [payload, entry] of [
     [{ text: '/week@tobi' }], [{ text: '오늘 일정 알려줘' }], [{ text: '선택', button: { token: 'internal' } }],
     [{ text: '오후 세 시' }, { kind: 'verified-followup' }],
     [{ text: '병원 완료' }, { kind: 'direct-completion' }]
   ]) {
-    assert.equal(await route({ job: { payload }, options }, entry), payload.text);
+    assert.equal(await route({ job: { payload }, options, store }, entry), payload.text);
   }
   await assert.rejects(route({ job: { payload: { text: '네', calendarEntry: { kind: 'verified-followup' } } }, options }),
     /Trusted Calendar entry/);

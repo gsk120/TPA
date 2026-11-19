@@ -9,6 +9,8 @@ import {messageReferences,quickCommand} from './context.js';
 import {Codex} from './assistant/codex.js';
 import {schedule} from './processor.js';
 import {createSkillRouter} from './core/router.js';
+import {recordSkillFailure} from './core/complete.js';
+import {deliverSkillContent} from './core/delivery.js';
 import {createCalendarSkill,inspectCalendarEntry} from './skills/calendar.js';
 import {debugEvent,errorFields,jobDebug,jobTrace,withJobTrace} from './diagnostics.js';
 let stopping=false;const shutdown=new AbortController();
@@ -99,13 +101,12 @@ async function main(stage){
          chat_id:f.chat_id, message_id:job.payload.button.messageId, reply_markup:{inline_keyboard:[]}
        }, 3000).catch(() => {});
      }
-    }catch(e){
+    }catch(cause){
+     const e=cause instanceof Error?cause:new Error('작업 실행에 실패했어요.',{cause});
      debugEvent(trace,'worker.error',{phase,abortSource:shutdown.signal.aborted?'shutdown':signal?.aborted?'heartbeat':undefined,...errorFields(e)});
      if(e.codexFailure)console.error('Codex CLI 실패',e.codexFailure.stage,e.codexFailure.category);
-     if(job&&!signal?.aborted)await withJobTrace(trace,()=>store.fail(job,safeError(e), {
-       silent: !!job.payload.button && e.message === '버튼이 이미 처리됐거나 만료됐어요.',
-       weeklySave: e.message === '반복 일정 저장 오류'
-     })).catch(error=>debugEvent(trace,'worker.failure_save.error',errorFields(error)));
+     if(job&&!signal?.aborted)await withJobTrace(trace,()=>recordSkillFailure(store,job,e,safeError(e)))
+      .catch(error=>debugEvent(trace,'worker.failure_save.error',errorFields(error)));
     }
     finally{clearInterval(timer);busy.delete(f.id);}
    }
@@ -126,13 +127,25 @@ async function main(stage){
     const parts=splitMessage(d.text);
     deliveryPhase='telegram-send';
     debugEvent(deliveryTrace,'delivery.send',{kind:deliveryKind,attempt:d.attempts+1});
-    const ids=await tg.send(f.chat_id,d.text,memory?.replyMarkup);
+    const structured = d.result?.delivery;
+    let ids;
+    if (structured) {
+     try { await verifyMember(tg,f.chat_id,structured.actor); }
+     catch (cause) {
+      if (cause.message.startsWith('권한 확인')) throw new Error('텔레그램 원래 요청자의 그룹 권한이 만료됐어요.', { cause });
+      throw cause;
+     }
+     ids=await deliverSkillContent(tg,store,d,f.chat_id);
+    } else ids=await tg.send(f.chat_id,d.text,memory?.replyMarkup);
     deliveryPhase='result-save';
-    await store.deliveryResult(d,'sent',{messageIds:ids,chatId:f.chat_id,messageRefs:messageReferences(parts,linked),replyOwner:memory?.ownerActor,replyPending:memory?.pending,requestId:memory?.requestId,workflowToken:memory?.workflowToken});
+    await store.deliveryResult(d,'sent',{messageIds:ids,chatId:f.chat_id,...(!structured && {
+     messageRefs:messageReferences(parts,linked),replyOwner:memory?.ownerActor,replyPending:memory?.pending,
+     requestId:memory?.requestId,workflowToken:memory?.workflowToken
+    })});
     debugEvent(deliveryTrace,'delivery.done',{kind:deliveryKind,pendingQuestion:!!memory?.pending,
      question:memory?.pending&&memory.requestId?jobTrace('calendar-question',memory.requestId):undefined});
    }catch(e){
-    const status=e.retryAfter&&d.attempts<3?'pending':e.uncertain||!e.message?.startsWith('텔레그램')?'uncertain':'failed';
+    const status=e.uncertain||!e.message?.startsWith('텔레그램')?'uncertain':e.retryAfter&&d.attempts<3?'pending':'failed';
     debugEvent(deliveryTrace,'delivery.error',{kind:deliveryKind,phase:deliveryPhase,status,...errorFields(e)});
     await store.deliveryResult(d,status,{reason:safeError(e)},Math.min(e.retryAfter||0,3600));
    }

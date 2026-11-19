@@ -1,9 +1,11 @@
 import { createHash } from 'node:crypto';
 import { validateSkillRouting } from '../assistant/skill-routing.js';
-import { calendarPendingNotice, finishCalendarPending } from '../calendar-entry.js';
+import { calendarPendingNotice, planCalendarPending } from '../calendar-entry.js';
 import { quickCommand } from '../context.js';
 import { errorFields, jobDebug } from '../diagnostics.js';
 import { skillCatalog, skillRoutingVersion } from './skill-catalog.js';
+import { completeSkillResult } from './complete.js';
+import { textResult } from './skill.js';
 
 /**
  * @param {import('./skill.js').Skill[]} skills
@@ -13,10 +15,10 @@ export function createJobDispatcher(skills, defaultSkillId) {
   const byId = new Map(skills.map(skill => [skill.id, skill]));
 
   /** @param {import('./skill.js').JobContext} input */
-  return function dispatchJob(input, skillId = defaultSkillId) {
+  return async function dispatchJob(input, skillId = defaultSkillId, choice) {
     const skill = byId.get(skillId);
-    if (!skill) return Promise.reject(new Error(`Unknown Skill: ${skillId}`));
-    return skill.handle(input);
+    if (!skill) throw new Error(`Unknown Skill: ${skillId}`);
+    return completeSkillResult(input, await skill.handle(input), skillId, choice);
   };
 }
 
@@ -43,23 +45,44 @@ export function createSkillRouter({ skills, classifySkill, authorizeSkill, inspe
   return async function routeSkillJob(input, calendarEntry) {
     const { job, store, signal, options } = input;
     const text = job.payload.text;
+    const allowed = skillId => skillId === 'calendar' || authorizeSkill?.(skillId, input);
+    const scopedInput = skillId => skillId === 'calendar' ? input : {
+      ...input,
+      options:{ ...options, authorize:async () => {
+        await options.authorize();
+        if (!await allowed(skillId)) throw new Error('권한 확인: 이 기능을 사용할 권한을 확인하지 못했어요.');
+      } }
+    };
     signal?.throwIfAborted();
+    if (job.payload.button) {
+      const { token, index } = job.payload.button;
+      const action = await store.runtimeValue?.('button:' + token);
+      if (action?.kind === 'skill-choice') {
+        if (action.actor !== String(job.payload.actor) || action.chatId !== String(job.payload.chatId)
+            || !(Date.parse(action.expiresAt) > +input.now) || typeof action.choices?.[index] !== 'string') {
+          throw new Error('버튼이 이미 처리됐거나 만료됐어요.');
+        }
+        await options.authorize();
+        if (!registered.has(action.skillId) || !await allowed(action.skillId)) {
+          throw new Error('권한 확인: 이 기능을 사용할 권한을 확인하지 못했어요.');
+        }
+        signal?.throwIfAborted();
+        return dispatch({ ...scopedInput(action.skillId), selection:{ value:action.choices[index] } }, action.skillId, { token, action });
+      }
+    }
     jobDebug('router.entry.start');
     const entry = inspectCalendar ? await inspectCalendar(input) : calendarEntry;
     jobDebug('router.entry.result', { kind:entry?.kind, pending:!!entry?.contextKey });
 
     const finish = async (message, failed = false, reason) => {
-      signal?.throwIfAborted();
-      await options.authorize();
-      signal?.throwIfAborted();
       jobDebug('router.save.start', { reason, failed });
-      const reply = await store.finishSkillRouting(job, message, { failed });
+      const reply = await completeSkillResult(input, textResult(message, failed ? 'failed' : 'success'));
       jobDebug('router.save.done', { reason, failed });
       return reply;
     };
-    const pendingConflict = ({ before = '', after = '', reason = 'pending' } = {}) => {
+    const pendingConflict = async ({ before = '', after = '', reason = 'pending' } = {}) => {
       if (inspectCalendar && entry?.contextKey) {
-        return finishCalendarPending(input, entry, { before, after });
+        return completeSkillResult(input, await planCalendarPending(input, entry, { before, after }), 'calendar');
       }
       return finish([before, calendarPendingNotice, after].filter(Boolean).join('\n\n'), false, reason);
     };
@@ -70,13 +93,13 @@ export function createSkillRouter({ skills, classifySkill, authorizeSkill, inspe
           : finish(unsupported, false, 'skill-unregistered');
       }
       await options.authorize();
-      if (skillId !== 'calendar' && !await authorizeSkill?.(skillId, input)) {
+      if (!await allowed(skillId)) {
         return finish('이 기능을 사용할 권한을 확인하지 못했어요.', false, 'skill-denied');
       }
       signal?.throwIfAborted();
       jobDebug('router.dispatch', { skill:skillId, entry:calendar?.kind });
       return dispatch(inspectCalendar && skillId === 'calendar'
-        ? { ...input, options:{ ...options, calendarEntry:calendar } } : input, skillId);
+        ? { ...input, options:{ ...options, calendarEntry:calendar } } : scopedInput(skillId), skillId);
     };
 
     if (entry?.kind === 'blocked') return entry.showPending ? pendingConflict({ reason:'entry-blocked' })

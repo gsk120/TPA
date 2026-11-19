@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { PGlite } from '@electric-sql/pglite';
 import { createJobDispatcher } from '../src/core/router.js';
+import { textResult } from '../src/core/skill.js';
 import { createCalendarSkill } from '../src/skills/calendar.js';
 import { processJob } from '../src/processor.js';
 import { defaults } from '../src/settings.js';
@@ -11,7 +12,7 @@ import { Store } from '../src/storage.js';
 
 const dispatchCalendar = (skill = createCalendarSkill()) => createJobDispatcher([skill], 'calendar');
 
-test('Calendar forwards every original argument once and returns the same pending promise', async () => {
+test('Calendar forwards every original argument once and returns its planner promise', async () => {
   const args = [];
   const { promise, resolve } = Promise.withResolvers();
   const calendar = createCalendarSkill((...received) => {
@@ -29,14 +30,15 @@ test('Calendar forwards every original argument once and returns the same pendin
     options: { settings: defaults, settingsVersion: 7, authorize: async () => {} }
   };
 
-  const result = dispatchCalendar(calendar)(context);
+  const result = calendar.handle(context);
   assert.strictEqual(result, promise);
   assert.equal(args.length, 1);
   const expected = [context.job, context.store, context.ai, context.now, context.signal, context.options];
   assert.equal(args[0].length, expected.length);
   expected.forEach((value, index) => assert.strictEqual(args[0][index], value));
-  resolve('일정 처리 결과');
-  assert.equal(await result, '일정 처리 결과');
+  const planned = textResult('일정 처리 결과');
+  resolve(planned);
+  assert.strictEqual(await result, planned);
 });
 
 test('Calendar rejects with the original processor error after asynchronous work', async () => {

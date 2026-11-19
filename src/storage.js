@@ -46,7 +46,7 @@ export class Store {
     // A dead lock connection must stop the process, otherwise two consumers could run.
     client.on('error', () => { console.error('실행 잠금 연결이 끊겨 안전하게 종료합니다.'); process.exit(1); });
     this.lock = client;
-    await this.pool.query("update assistant.deliveries set status='uncertain' where family_id=$1 and status='sending'", [this.familyId]);
+    await recoverDeliveries(this.pool, this.familyId);
   }
   async close() { if (this.lock) { await this.lock.query('select pg_advisory_unlock_all()').catch(() => {}); this.lock.release(); } await this.pool.end(); }
   async tasks() { return (await this.pool.query('select data from assistant.tasks where family_id=$1 order by id', [this.familyId])).rows.map(r => r.data); }
@@ -124,6 +124,7 @@ export class Store {
       const job = rows[0]; if (!job) return null;
       // Keep the worker's private cache out of handlers and their prompts.
       delete job.payload._skillRouting;
+      delete job.payload._skillOutcome;
       job.lease = randomUUID();
       await c.query("update assistant.jobs set status='running',lease=$3,lease_until=now()+interval '90 seconds',attempts=attempts+1 where family_id=$1 and id=$2", [this.familyId, job.id, job.lease]);
       return job;
@@ -149,11 +150,12 @@ export class Store {
     if (!rows.length) throw new Error('작업 실행 권한이 만료됐습니다.');
     return rows[0].decision;
   }
-  async finishSkillRouting(job, reply, { failed = false, calendarPending } = {}) {
+  async finishSkillRouting(job, reply, { failed = false, waiting = false, calendarPending, delivery, button, choice } = {}) {
     return this.tx(async c => {
       const { rowCount } = await c.query(
-        "update assistant.jobs set status=$4,error=$5,finished_at=now() where family_id=$1 and id=$2 and lease=$3 and status='running' and lease_until>now()",
-        [this.familyId, job.id, job.lease, failed ? 'failed' : 'done', failed ? reply : null]
+        "update assistant.jobs set status=$4,error=$5,finished_at=now(),payload=payload || jsonb_build_object('_skillOutcome',$6::text) where family_id=$1 and id=$2 and lease=$3 and status='running' and lease_until>now()",
+        [this.familyId, job.id, job.lease, failed ? 'failed' : 'done', failed ? reply : null,
+          failed ? 'failed' : waiting ? 'waiting' : 'success']
       );
       if (!rowCount) throw new Error('작업 실행 권한이 만료됐습니다.');
       let context;
@@ -174,14 +176,23 @@ export class Store {
         else if (replyToQuestion) context = { refs, ownerActor:String(actor), pending:true,
           requestId:state.requestId, workflowToken:state.workflow?.token };
       }
+      if (choice) {
+        const consumed = await c.query(
+          "update assistant.runtime set value='null'::jsonb where family_id=$1 and key=$2 and value=$3::jsonb and value->>'expiresAt'>$4",
+          [this.familyId, 'button:' + choice.token, choice.action, new Date().toISOString()]
+        );
+        if (!consumed.rowCount) throw new Error('버튼이 이미 처리됐거나 만료됐어요.');
+      }
+      if (button) await c.query('insert into assistant.runtime(family_id,key,value) values($1,$2,$3)',
+        [this.familyId, 'button:' + button.token, button.action]);
       const deliveryId = (failed ? 'error:' : 'reply:') + job.id;
       await this.enqueue(c, deliveryId, reply);
-      if (context) await c.query('update assistant.deliveries set result=$3 where family_id=$1 and id=$2',
-        [this.familyId, deliveryId, {context}]);
+      if (context || delivery) await c.query('update assistant.deliveries set result=$3 where family_id=$1 and id=$2',
+        [this.familyId, deliveryId, {context, delivery, ...(delivery && { progress:{ messageIds:[], inFlight:false } })}]);
       return reply;
     });
   }
-  async finish(job, changes, reply, settingsChange = null, memory = null) {
+  async finish(job, changes, reply, settingsChange = null, memory = null, outcome = 'success') {
     return this.tx(async c => {
       const r = await c.query("select id from assistant.jobs where family_id=$1 and id=$2 and lease=$3 and status='running' and lease_until>now() for update", [this.familyId, job.id, job.lease]);
       if (!r.rowCount) throw new Error('작업 실행 권한이 만료됐습니다.');
@@ -279,13 +290,13 @@ export class Store {
         await c.query('update assistant.deliveries set result=$3 where family_id=$1 and id=$2',[this.familyId,'reply:'+job.id,{context:{refs:memory.refs||[],ownerActor:String(job.payload.actor),pending:conversation?.pending||false,requestId:conversation?.requestId||null,workflowToken:conversation?.workflow?.token,expiresAt:memory.expiresAt,replyMarkup:memory.button?.markup}}]);
         if(conversation)await c.query('insert into assistant.runtime(family_id,key,value) values($1,$2,$3) on conflict(family_id,key) do update set value=excluded.value',[...conversationKey,conversation]);
       }
-      await c.query("update assistant.jobs set status='done',finished_at=now() where family_id=$1 and id=$2", [this.familyId, job.id]);
+      await c.query("update assistant.jobs set status='done',finished_at=now(),payload=payload || jsonb_build_object('_skillOutcome',$3::text) where family_id=$1 and id=$2", [this.familyId, job.id, outcome]);
       return reply;
     });
   }
   async fail(job, text, {silent = false, weeklySave = false} = {}) {
     const recorded = await this.tx(async c => {
-      const r = await c.query("update assistant.jobs set status='failed',error=$4,finished_at=now() where family_id=$1 and id=$2 and lease=$3 and status='running' and lease_until>now()", [this.familyId, job.id, job.lease, text]);
+      const r = await c.query("update assistant.jobs set status='failed',error=$4,finished_at=now(),payload=payload || '{\"_skillOutcome\":\"failed\"}'::jsonb where family_id=$1 and id=$2 and lease=$3 and status='running' and lease_until>now()", [this.familyId, job.id, job.lease, text]);
       if (r.rowCount && !silent) {
         // An uncertain COMMIT can only be reported as a rollback if this job is still running.
         const reason = weeklySave ? '반복 일정 저장이 취소되어 새로 등록된 시리즈는 0건이에요.'
@@ -354,8 +365,9 @@ export class Store {
   }
   async deliveryResult(d, status, result, retryAfter = 0) {
     if(status==='pending'&&d.result?.context)result={...result,context:d.result.context};
+    if (d.result?.delivery) result = { ...result, delivery:d.result.delivery, progress:d.result.progress };
     await this.tx(async c=>{
-      const changed=await c.query("update assistant.deliveries set status=$3,result=$4,next_attempt=now()+($5::int * interval '1 second') where family_id=$1 and id=$2 and status='sending'", [this.familyId, d.id, status, result, retryAfter]);
+      const changed=await c.query("update assistant.deliveries set status=$3,result=$4,next_attempt=now()+($5::int * interval '1 second') where family_id=$1 and id=$2 and status='sending' and attempts=$6", [this.familyId, d.id, status, result, retryAfter, d.attempts + 1]);
       if(!changed.rowCount)return;
       if(status==='sent' && result.messageRefs){
         for(let i=0;i<result.messageIds.length;i++){
@@ -365,6 +377,14 @@ export class Store {
       }
       await c.query("update assistant.runtime set value='null'::jsonb where family_id=$1 and (key like 'message:%' or key like 'conversation:%' or key like 'button:%') and value->>'expiresAt' < $2",[this.familyId,new Date().toISOString()]);
     });
+  }
+  async saveDeliveryProgress(d, progress) {
+    const {rowCount} = await this.pool.query(
+      "update assistant.deliveries set result=jsonb_set(result,'{progress}',$3::jsonb) where family_id=$1 and id=$2 and status='sending' and attempts=$4",
+      [this.familyId, d.id, progress, d.attempts + 1]
+    );
+    if (!rowCount) throw Object.assign(new Error('텔레그램 발송 상태 확인에 실패했어요.'), { uncertain:true });
+    d.result.progress = progress;
   }
   async issues() { return (await this.pool.query("select id,status,created_at from assistant.deliveries where family_id=$1 and status in ('uncertain','failed') order by created_at desc limit 20", [this.familyId])).rows; }
   async backup() {
@@ -380,4 +400,11 @@ export class Store {
   async restoreBackup(snapshot) {
     return this.tx(c => restoreFamilyBackup(c,this.familyId,snapshot));
   }
+}
+
+export function recoverDeliveries(pool, familyId = null) {
+  // An in-flight request may already have reached Telegram. Never replay it automatically.
+  return pool.query(`update assistant.deliveries set status=case
+    when result ? 'delivery' and result->'progress'->>'inFlight'='false' then 'pending' else 'uncertain' end
+    where status='sending' and ($1::uuid is null or family_id=$1)`, [familyId]);
 }

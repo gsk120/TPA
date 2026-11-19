@@ -3,6 +3,7 @@ import { directCompletionTarget, requestedCompletionTitle } from './natural.js';
 import { isActive } from './tasks.js';
 import { defaults } from './settings.js';
 import { jobDebug, jobTrace } from './diagnostics.js';
+import { calendarPendingResult } from './core/complete.js';
 
 export const calendarPendingNotice = '먼저 진행 중인 일정 확인 질문에 답해주세요. 확인이 끝나면 이 요청 전체를 다시 보내주세요.';
 const unclearReply = '이어갈 일정 확인 질문을 찾지 못했어요. 원래 질문에 필요한 답이나 새 요청 전체를 보내주세요.';
@@ -51,7 +52,7 @@ export function isCalendarQuestionReply(reference, pending, actor) {
     && (!pending.workflow || reference.workflowToken === pending.workflow.token);
 }
 
-export async function finishCalendarPending({ job, store, now, signal, options }, entry, {
+export async function planCalendarPending({ job, store, now, options }, entry, {
   mode = 'conflict', before = '', after = ''
 } = {}) {
   const { actor, chatId } = job.payload;
@@ -97,13 +98,7 @@ export async function finishCalendarPending({ job, store, now, signal, options }
   } else if (entry.contextKey && isPendingInChat(state, chatId)) {
     reply = joinReply(pendingContextChanged);
   }
-  signal?.throwIfAborted();
-  await options?.authorize?.();
-  signal?.throwIfAborted();
-  jobDebug('calendar.pending.reply.start', { mode, matched:!!calendarPending });
-  const sentReply = await store.finishSkillRouting(job, reply, { calendarPending });
-  jobDebug('calendar.pending.reply.done', { mode, matched:!!calendarPending && sentReply === reply });
-  return sentReply;
+  return calendarPendingResult(reply, calendarPending);
 }
 
 function candidateAnswer(text, state, tasks) {
