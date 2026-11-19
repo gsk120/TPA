@@ -10,6 +10,16 @@ export function quickCommand(text){
  return null;
 }
 export function followup(text){if(/추가|새로/.test(text))return false;if(/(?:일정|목록|할\s*일|과업)/.test(text)&&/(?:알려|보여|띄워|조회)/.test(text)&&!/(?:바꿔|변경|미뤄|완료|취소|수정)/.test(text))return false;return /^(?:그거|그건|그걸|그것|\d+(?:번|번째)?(?:[야요!.\s]|$)|둘\s*다|두\s*개|전부|모두|첫\s*번째|두\s*번째|마지막|응|네|예|맞아|완료|끝|했어|했음|내일로|모레로|다음\s*주(?:로|\s)|이번\s*주\s|[월화수목금토일]요일(?:로|\s|$)|미뤄|취소|오전|오후|\d{1,2}[.:월시일])/u.test(text.trim());}
+
+export function liveCalendarState(state, actor, now) {
+  return state?.actor === String(actor) && Date.parse(state.expiresAt) > +now ? state : null;
+}
+
+export function calendarStateKey(state) {
+  return state ? JSON.stringify([state.requestId, state.workflow?.token ?? null, state.expiresAt]) : null;
+}
+
+export const conversationLifetimeMs = 2 * 3600000;
 export const settingsIntent=text=>/(?:점검|알림|시간대|타임존)/.test(text)&&/(?:매일|매주|주간|일일|중지|재개|설정|시간대|타임존)/.test(text);
 const stops=new Set(['일정','과업','할일','목록','오늘','내일','모레','이번주','다음주','지난주','전체','모두','관련','언제','왜','뭐','뭐야','그거','그건','그걸','그것','알려줘','보여줘','조회','찾아줘','해주세요','해줘','추가','추가해줘','등록','등록해줘','예약','변경','변경해줘','미뤄줘','바꿔줘','완료','완료했어','완료해줘','취소','취소해줘','끝','했어','지난','작년','올해','다음','현재','준비','오전','오후','까지','결정','날짜','시간']);
 export function searchTerms(text){return [...new Set((text.match(/[가-힣A-Za-z0-9_-]+/gu)||[]).map(t=>t.replace(/(?:했는데|했어|해줘|까지|으로|한테|에게|에서|은|는|을|를|이|가|도|에|로)$/u,'')).filter(t=>t.length>=2&&!/^\d+$/.test(t)&&!stops.has(t)&&!/[월일시분]$/.test(t)))].slice(0,12);}
@@ -77,7 +87,7 @@ export function nextConversation(actor,text,reply,taskIds,previous,now=new Date(
  request.unresolved=requestInfo.clarification?.unresolved||'';
  request.question=pending?reply.slice(0,2000):null;
  request.candidateOrder=[...new Set(taskIds)];
- return {actor:String(actor),requestId:previous?.pending&&requestInfo.continuation?previous.requestId:randomUUID(),pending,request,taskIds:[...new Set(taskIds)],expiresAt:new Date(now.getTime()+2*3600000).toISOString(),turns:[...old,{actor:String(actor),text:text.slice(0,1600)},{actor:'assistant',text:reply.slice(0,1600)}].slice(-4)};
+ return {actor:String(actor),requestId:previous?.pending&&requestInfo.continuation?previous.requestId:randomUUID(),pending,request,taskIds:[...new Set(taskIds)],expiresAt:new Date(now.getTime()+conversationLifetimeMs).toISOString(),turns:[...old,{actor:String(actor),text:text.slice(0,1600)},{actor:'assistant',text:reply.slice(0,1600)}].slice(-4)};
 }
 export function messageReferences(parts,refs){return parts.map(part=>[...new Set(refs.filter(t=>part.includes(t.title.replace(/[\r\n]+/g,' ').trim())).map(t=>t.id))]);}
 export function summarizeHistory(events){return events.map(e=>({actor:e.actor,task_id:e.task_id,at:e.at,reason:(e.reason||'').slice(0,250),reasonTruncated:(e.reason||'').length>250,before:summary(e.before),after:summary(e.after)}));}

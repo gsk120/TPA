@@ -7,6 +7,8 @@ import { routeUpdate } from '../src/router.js';
 import { processJob } from '../src/processor.js';
 import { messageReferences } from '../src/context.js';
 import { splitMessage } from '../src/telegram.js';
+import { createSkillRouter } from '../src/core/router.js';
+import { createCalendarSkill, inspectCalendarEntry } from '../src/skills/calendar.js';
 
 const bot = { id: 99, username: 'fixture_tpa_bot', is_bot: true };
 const chatId = -10;
@@ -40,7 +42,7 @@ const noAi = {
   answer: async () => assert.fail('unexpected AI answer')
 };
 
-async function fixture(t) {
+async function fixture(t, routed = false) {
   const db = new PGlite();
   t.after(() => db.close());
   await db.exec('create role anon; create role authenticated');
@@ -53,6 +55,10 @@ async function fixture(t) {
   };
   const pool = { query, connect: async () => ({ query, release() {} }) };
   const families = new Families(pool, bot.id);
+  const route = createSkillRouter({
+    skills:[createCalendarSkill()], inspectCalendar:inspectCalendarEntry,
+    classifySkill:async () => ({ kind:'single', skills:['calendar'] })
+  });
   await families.init();
   const family = await families.setup(chatId, userId);
 
@@ -88,7 +94,8 @@ async function fixture(t) {
     const store = families.store(await families.family(message.chat ?? chatId));
     const job = await store.claim('tg:' + incoming.update_id);
     assert.ok(job, 'Telegram update must have a queued job');
-    return processJob(job, store, ai, now);
+    return routed ? route({job, store, ai, now, options:{authorize:async () => {}}})
+      : processJob(job, store, ai, now);
   }
 
   async function recordBotReply(store, messageId, chat = chatId) {
@@ -107,8 +114,8 @@ async function fixture(t) {
   return { families, run, enqueue, replay, recordBotReply, newStore: () => families.store(family) };
 }
 
-test('ordinary appointments can be created, listed, edited, completed and cancelled through the job queue', async t => {
-  const { run, newStore } = await fixture(t);
+for (const routed of [false, true]) test(`ordinary appointments can be created, listed, edited, completed and cancelled through the job queue (${routed ? '3-B' : 'legacy'})`, async t => {
+  const { run, newStore } = await fixture(t, routed);
   const store = newStore();
   const checkup = appointment('치과 검진');
   const visit = appointment('도서관 방문', { time: '13:00' });
@@ -150,8 +157,8 @@ test('ordinary appointments can be created, listed, edited, completed and cancel
   assert.equal((await store.history()).length, 5);
 });
 
-test('repeat registration projects occurrences; changing one occurrence preserves the series and sibling', async t => {
-  const { run, newStore } = await fixture(t);
+for (const routed of [false, true]) test(`repeat registration and occurrence changes preserve the series and sibling (${routed ? '3-B' : 'legacy'})`, async t => {
+  const { run, newStore } = await fixture(t, routed);
   const store = newStore();
   const title = '서버 점검';
   const series = {
@@ -168,6 +175,12 @@ test('repeat registration projects occurrences; changing one occurrence preserve
   assert.deepEqual([first.dueDate, sibling.dueDate], [originalDay, originalTomorrow]);
   assert.deepEqual(await store.tasks(), []);
   assert.match(await run('/list'), /서버 점검/);
+  assert.match(await run('!그거 메모 알려줘', {
+    answer: async ({ tasks }) => {
+      assert.ok(tasks.length && tasks.every(task => task.recurrence?.seriesId === first.recurrence.seriesId));
+      return answer({reply:'서버 점검 메모 확인'});
+    }
+  }), /서버 점검 메모/);
   const before = (await store.backup()).calendar.schedule_series;
   assert.equal(before.length, 1);
   await run(`!${originalTomorrow} 서버 점검 일정만 18시로 바꿔줘`, {
@@ -184,6 +197,15 @@ test('repeat registration projects occurrences; changing one occurrence preserve
   assert.deepEqual(snapshot.calendar.schedule_series, before);
   assert.equal(snapshot.calendar.schedule_exceptions.length, 1);
   assert.equal(snapshot.calendar.schedule_exceptions[0].anchor_key, sibling.recurrence.anchor);
+  const cancel = (scope, question = null) => ({classify:async () => ({
+    intent:'cancel',targets:[title],answer:null,cancellation:{scope,date:null,question}
+  })});
+  assert.match(await run('!서버 점검 반복 일정 취소 범위를 확인해줘',cancel(null,'전체 시리즈인가요, 한 회차인가요?')),
+    /전체 시리즈인가요/);
+  assert.match(await run('!전체',cancel('series')),/전체 취소 완료/);
+  assert.match(await run(text,ai,options),/시리즈 등록/);
+  const [active] = await store.activeScheduleSeries();
+  assert.notEqual(active.id,first.recurrence.seriesId);
 });
 
 async function askForTime(run, options) {
@@ -206,8 +228,8 @@ async function askForTime(run, options) {
   return original;
 }
 
-test('a Telegram confirmation restores a persisted LangGraph checkpoint and retains the original date across midnight', async t => {
-  const { run, newStore, recordBotReply } = await fixture(t);
+for (const routed of [false, true]) test(`a Telegram confirmation restores the saved checkpoint across midnight (${routed ? '3-B' : 'legacy'})`, async t => {
+  const { run, newStore, recordBotReply } = await fixture(t, routed);
   const original = await askForTime(run);
   const store = newStore();
   const pending = await store.conversation(userId);
@@ -241,8 +263,8 @@ test('a Telegram confirmation restores a persisted LangGraph checkpoint and reta
   assert.equal((await reopenedStore.tasks()).length, 1);
 });
 
-test('a persisted confirmation rejects a different actor, a changed chat and an expired conversation', async t => {
-  const { families, run, newStore, recordBotReply } = await fixture(t);
+for (const routed of [false, true]) test(`a persisted confirmation rejects a different actor, chat or expired conversation (${routed ? '3-B' : 'legacy'})`, async t => {
+  const { families, run, newStore, recordBotReply } = await fixture(t, routed);
   await askForTime(run);
   const store = newStore();
   const pending = await store.conversation(userId);

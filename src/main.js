@@ -8,15 +8,14 @@ import {Telegram,splitMessage} from './telegram.js';
 import {messageReferences,quickCommand} from './context.js';
 import {Codex} from './assistant/codex.js';
 import {schedule} from './processor.js';
-import {createJobDispatcher} from './core/router.js';
-import {createCalendarSkill} from './skills/calendar.js';
-const dispatchJob=createJobDispatcher([createCalendarSkill()],'calendar');
+import {createSkillRouter} from './core/router.js';
+import {createCalendarSkill,inspectCalendarEntry} from './skills/calendar.js';
 let stopping=false;const shutdown=new AbortController();
 let runtime;
 function stop(){stopping=true;shutdown.abort();}
 for(const name of ['SIGINT','SIGTERM'])process.on(name,()=>runtime?runtime.stop():stop());
 const pause=ms=>sleep(ms,undefined,{signal:shutdown.signal}).catch(()=>{});
-function safeError(e){return /^(버튼|되돌릴|선택한|AI 응답|AI 작업|Codex 실행|자료가 커서|목록이 변경|다른 작업|과업 형식|필드 형식|제목·종류|날짜를|시각을|시각에는|종료 날짜|이미 지난|한 번에|지원하지|신규 과업|작업 실행|알림 시각|설정|시간대|요일|권한 확인)/.test(e.message)?e.message.slice(0,300):'연결 또는 처리 오류입니다. 잠시 후 다시 요청해주세요.';}
+function safeError(e){return /^(버튼|되돌릴|선택한|AI 응답|AI 작업|Codex 실행|자료가 커서|목록이 변경|다른 작업|과업 형식|필드 형식|제목·종류|날짜를|시각을|시각에는|종료 날짜|이미 지난|한 번에|지원하지|신규 과업|작업 실행|알림 시각|설정|시간대|요일|권한 확인|확인 요청이 이미)/.test(e.message)?e.message.slice(0,300):'연결 또는 처리 오류입니다. 잠시 후 다시 요청해주세요.';}
 const startupCodes = new Set([
  'ENOTFOUND','EAI_AGAIN','ECONNREFUSED','ECONNRESET','ETIMEDOUT','EPIPE','ENETUNREACH','EHOSTUNREACH',
  'UND_ERR_CONNECT_TIMEOUT','UND_ERR_SOCKET','ENOENT','EACCES','EPERM','EADDRINUSE',
@@ -37,6 +36,13 @@ function startupError(error) {
 async function main(stage){
  stage('환경설정 확인');
  const cfg=config(),tg=new Telegram(cfg.token,fetch,shutdown.signal),ai=new Codex(cfg);
+ const dispatchJob=createSkillRouter({
+  skills:[createCalendarSkill()],inspectCalendar:inspectCalendarEntry,
+  classifySkill:async (text,signal)=>{
+   try{return await ai.classifySkill(text,signal);}
+   catch(error){if(error.codexFailure)console.error('Codex CLI 실패',error.codexFailure.stage,error.codexFailure.category);throw error;}
+  }
+ });
  stage('텔레그램 봇 인증 (getMe)');
  const bot=await tg.call('getMe');
  stage('텔레그램 웹훅 확인');
@@ -62,10 +68,10 @@ async function main(stage){
   const worker=async()=>{while(!stopping){let worked=false;try{
    for(const f of await families.list()){
     if(stopping)break;if(!f.active||busy.has(f.id))continue;busy.add(f.id);
-    const store=families.store(f);let job,timer;
+    const store=families.store(f);let job,timer,signal;
     try{
      job=await store.claim();if(!job)continue;worked=true;
-     const controller=new AbortController();const signal=AbortSignal.any([controller.signal,shutdown.signal]);let beating=false;
+     const controller=new AbortController();signal=AbortSignal.any([controller.signal,shutdown.signal]);let beating=false;
      timer=setInterval(async()=>{if(beating)return;beating=true;try{await store.heartbeat(job);}catch{controller.abort();}finally{beating=false;}},20000);
      await authorize(f,job.payload.actor);
      const state=await families.settings(f);
@@ -79,7 +85,7 @@ async function main(stage){
      }
     }catch(e){
      if(e.codexFailure)console.error('Codex CLI 실패',e.codexFailure.stage,e.codexFailure.category);
-     if(job)await store.fail(job,safeError(e), {
+     if(job&&!signal?.aborted)await store.fail(job,safeError(e), {
        silent: !!job.payload.button && e.message === '버튼이 이미 처리됐거나 만료됐어요.',
        weeklySave: e.message === '반복 일정 저장 오류'
      }).catch(()=>{});

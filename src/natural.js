@@ -231,7 +231,7 @@ async function planDateCompletion({job, now, current, loadTasks, originalText, p
 }
 
 export async function planNatural({job, store, ai, now, signal, options, current, tasks, loadTasks, originalText,
-  previous, reference, buttonInput, classification, resumedIntent, resumed}) {
+  previous, reference, buttonInput, classification, resumedIntent, resumed, verified, recentScope}) {
   let reply, changes = [], settingsChange = null, refs = [], conversation = null, retrievalReply = null, button = null;
   if (resumed && previous.request.dateCompletion
       || classification?.intent === 'complete' && classification.completion && classification.completion.scope !== 'named') {
@@ -265,7 +265,10 @@ export async function planNatural({job, store, ai, now, signal, options, current
   }
   const hasIndependentIntent = classification && !resumed && !['unknown','mixed'].includes(intent);
   const freshState = hasIndependentIntent ? null : previous;
-  const selection = buttonInput ? {
+  const selection = recentScope ? {
+    candidates:recentScope.targetIds.map(id => activeTasks.find(task => task.id === id || task.recurrence?.occurrenceId === id)).filter(Boolean),
+    context:[], continuation:false, request:null, blocked:null, coverage:{scope:'reply'}
+  } : buttonInput ? {
     candidates:[buttonInput.task], context:[], request:buttonInput.action.request,
     continuation:true, coverage:{scope:'button', providedTaskCount:1}
   } : classification?.intent === 'history'
@@ -277,12 +280,18 @@ export async function planNatural({job, store, ai, now, signal, options, current
     selection.continuation = true;
     selection.request = previous.request;
     selection.context = previous.turns || [];
-  } else if (resumed && !buttonInput && !selection.continuation) {
+  } else if ((resumed || verified) && !buttonInput && !selection.continuation) {
     Object.assign(selection, {
       candidates: tasks.filter(t => previous.taskIds.includes(t.id)),
       continuation:true, request:previous.request, blocked:null,
       context:previous.turns || [], coverage:{scope:'followup', familyTaskCount:tasks.length}
     });
+  }
+  if (recentScope) {
+    if (new Set(selection.candidates.map(task => task.id)).size !== recentScope.targetIds.length) {
+      return {reply:'❓ 이어갈 일정을 확인하지 못했어요. 일정 제목을 포함해 다시 요청해주세요.'};
+    }
+    selection.coverage.providedTaskCount = selection.candidates.length;
   }
   if (selection.request?.operation === 'weekly') {
     const reply = '이전 반복 일정 요청을 새 등록 방식으로 처리하려면 원래 요청과 답변을 함께 다시 보내주세요.';
@@ -294,7 +303,7 @@ export async function planNatural({job, store, ai, now, signal, options, current
       && reference.ownerActor === String(job.payload.actor) && reference.chatId === String(job.payload.chatId)));
   const dateReply = !buttonInput && awaitingTarget
     && /^(?:(?:오늘|내일|모레)|(?:\d{4}-\d{2}-\d{2})|(?:\d{1,2}\/\d{1,2})|(?:(?:\d{4}\s*년\s*)?\d{1,2}\s*월\s*\d{1,2}\s*일)|(?:(?:오전|오후)\s*)?\d{1,2}(?::\d{2}|\s*시(?:\s*(?:반|\d{1,2}\s*분))?))(?:\s*(?:거|것|건|일정))?(?:이요|요)?[.!\s]*$/u.test(originalText);
-  const exactScope = !occurrence && (!intent || intent === 'existing' || existingTarget) && !resumed && !buttonInput && !job.payload.replyTo && !dateReply
+  const exactScope = !recentScope && !occurrence && (!intent || intent === 'existing' || existingTarget) && !resumed && !buttonInput && !job.payload.replyTo && !dateReply
     ? duplicateTargets(originalText, activeTasks, completion, now, current.timeZone) : null;
   if (dateReply) {
     const filter = targetHints(originalText, now, current.timeZone);
@@ -377,6 +386,10 @@ export async function planNatural({job, store, ai, now, signal, options, current
       const answer=await ai.answer(input,signal);
       if(!Array.isArray(answer.actions))throw new Error('AI 응답 형식을 확인하지 못했어요.');
       verifyIntent(intent, answer);
+      if (recentScope && (answer.settings || answer.retrieval
+          || answer.actions.some(action => recentScope.read || action.operation !== 'update'))) {
+        throw new Error('AI 응답이 답장에 연결된 일정 범위를 벗어났어요.');
+      }
       if (cancelOccurrence && (answer.actions.length > 1 || answer.actions.some(a =>
         a.operation !== 'update' || a.task?.status !== 'cancelled' || !tasks.find(t => t.id === a.id)?.recurrence))) {
         throw new Error('선택한 반복 회차 한 건의 취소를 확인하지 못했어요.');

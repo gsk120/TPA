@@ -1,9 +1,11 @@
 import pg from 'pg';
 import { readFile } from 'node:fs/promises';
+import { isDeepStrictEqual } from 'node:util';
 import { randomUUID, createHash } from 'node:crypto';
 import { applyOccurrenceChange, createScheduleSeries, hasScheduleSchema, linkScheduleOccurrence, lockRegistrationSeries, readActiveScheduleSeries, readCalendarTasks, updateScheduleSeries } from './schedule-store.js';
 import { occurrenceId } from './recurrence.js';
 import { addScheduleBackup, restoreFamilyBackup } from './schedule-backup.js';
+import { calendarStateKey, liveCalendarState } from './context.js';
 
 export class Store {
   constructor(pool, familyId) { this.pool = pool; this.familyId = familyId; }
@@ -115,24 +117,67 @@ export class Store {
     return this.tx(async c => {
       const { rows } = await c.query("select * from assistant.jobs where family_id=$1 and ($2::text is null or id=$2) and (status='pending' or status='running' and lease_until<now()) order by created_at,id for update skip locked limit 1", [this.familyId,id]);
       const job = rows[0]; if (!job) return null;
+      // Keep the worker's private cache out of handlers and their prompts.
+      delete job.payload._skillRouting;
       job.lease = randomUUID();
       await c.query("update assistant.jobs set status='running',lease=$3,lease_until=now()+interval '90 seconds',attempts=attempts+1 where family_id=$1 and id=$2", [this.familyId, job.id, job.lease]);
       return job;
     });
   }
   async heartbeat(job) {
-    const r = await this.pool.query("update assistant.jobs set lease_until=now()+interval '90 seconds' where family_id=$1 and id=$2 and lease=$3 and status='running'", [this.familyId, job.id, job.lease]);
+    const r = await this.pool.query("update assistant.jobs set lease_until=now()+interval '90 seconds' where family_id=$1 and id=$2 and lease=$3 and status='running' and lease_until>now()", [this.familyId, job.id, job.lease]);
     if (!r.rowCount) throw new Error('작업 실행 권한이 만료됐습니다.');
+  }
+  async skillRoutingDecision(job) {
+    const { rows } = await this.pool.query(
+      "select payload->'_skillRouting' as decision from assistant.jobs where family_id=$1 and id=$2 and lease=$3 and status='running' and lease_until>now()",
+      [this.familyId, job.id, job.lease]
+    );
+    if (!rows.length) throw new Error('작업 실행 권한이 만료됐습니다.');
+    return rows[0].decision;
+  }
+  async saveSkillRoutingDecision(job, decision) {
+    const { rows } = await this.pool.query(
+      "update assistant.jobs set payload=jsonb_set(payload,'{_skillRouting}',coalesce(payload->'_skillRouting',$4::jsonb)) where family_id=$1 and id=$2 and lease=$3 and status='running' and lease_until>now() returning payload->'_skillRouting' as decision",
+      [this.familyId, job.id, job.lease, decision]
+    );
+    if (!rows.length) throw new Error('작업 실행 권한이 만료됐습니다.');
+    return rows[0].decision;
+  }
+  async finishSkillRouting(job, reply, { failed = false } = {}) {
+    return this.tx(async c => {
+      const { rowCount } = await c.query(
+        "update assistant.jobs set status=$4,error=$5,finished_at=now() where family_id=$1 and id=$2 and lease=$3 and status='running' and lease_until>now()",
+        [this.familyId, job.id, job.lease, failed ? 'failed' : 'done', failed ? reply : null]
+      );
+      if (!rowCount) throw new Error('작업 실행 권한이 만료됐습니다.');
+      await this.enqueue(c, (failed ? 'error:' : 'reply:') + job.id, reply);
+      return reply;
+    });
   }
   async finish(job, changes, reply, settingsChange = null, memory = null) {
     return this.tx(async c => {
       const r = await c.query("select id from assistant.jobs where family_id=$1 and id=$2 and lease=$3 and status='running' and lease_until>now() for update", [this.familyId, job.id, job.lease]);
       if (!r.rowCount) throw new Error('작업 실행 권한이 만료됐습니다.');
-      if (memory?.resumeToken) {
-        const {rows} = await c.query('select value from assistant.runtime where family_id=$1 and key=$2 for update',
-          [this.familyId, 'conversation:' + String(job.payload.actor)]);
+      const guard = memory?.calendarGuard;
+      const conversationKey = [this.familyId, 'conversation:' + String(job.payload.actor)];
+      if (guard || memory?.resumeToken) {
+        if (guard && memory.conversation && !guard.preserve) {
+          await c.query("insert into assistant.runtime(family_id,key,value) values($1,$2,'null'::jsonb) on conflict do nothing", conversationKey);
+        }
+        const {rows} = await c.query('select value, clock_timestamp() as checked_at from assistant.runtime where family_id=$1 and key=$2 for update',
+          conversationKey);
         const state = rows[0]?.value;
-        if (!state?.pending || state.workflow?.token !== memory.resumeToken) {
+        const current = guard && liveCalendarState(state, job.payload.actor, rows[0]?.checked_at);
+        if ((memory.resumeToken && (!state?.pending || state.workflow?.token !== memory.resumeToken))
+            || (guard && calendarStateKey(guard.includeRecent || current?.pending ? current : null) !== guard.expected)) {
+          throw new Error('확인 요청이 이미 처리됐거나 다른 요청으로 바뀌었어요.');
+        }
+      }
+      if (guard?.reference) {
+        const {rows} = await c.query('select value, clock_timestamp() as checked_at from assistant.runtime where family_id=$1 and key=$2 for share',
+          [this.familyId, 'message:' + (guard.reference.messageId % 1000)]);
+        if (!isDeepStrictEqual(rows[0]?.value, guard.reference) || !(Date.parse(guard.reference.expiresAt) > +rows[0]?.checked_at)) {
           throw new Error('확인 요청이 이미 처리됐거나 다른 요청으로 바뀌었어요.');
         }
       }
@@ -204,8 +249,9 @@ export class Store {
           await c.query('insert into assistant.runtime(family_id,key,value) values($1,$2,$3)',
             [this.familyId, 'button:' + memory.button.token, memory.button.action]);
         }
-        await c.query('update assistant.deliveries set result=$3 where family_id=$1 and id=$2',[this.familyId,'reply:'+job.id,{context:{refs:memory.refs||[],ownerActor:String(job.payload.actor),pending:memory.conversation?.pending||false,requestId:memory.conversation?.requestId||null,workflowToken:memory.conversation?.workflow?.token,expiresAt:memory.expiresAt,replyMarkup:memory.button?.markup}}]);
-        if(memory.conversation)await c.query('insert into assistant.runtime(family_id,key,value) values($1,$2,$3) on conflict(family_id,key) do update set value=excluded.value',[this.familyId,'conversation:'+String(job.payload.actor),memory.conversation]);
+        const conversation = guard?.preserve ? null : memory.conversation;
+        await c.query('update assistant.deliveries set result=$3 where family_id=$1 and id=$2',[this.familyId,'reply:'+job.id,{context:{refs:memory.refs||[],ownerActor:String(job.payload.actor),pending:conversation?.pending||false,requestId:conversation?.requestId||null,workflowToken:conversation?.workflow?.token,expiresAt:memory.expiresAt,replyMarkup:memory.button?.markup}}]);
+        if(conversation)await c.query('insert into assistant.runtime(family_id,key,value) values($1,$2,$3) on conflict(family_id,key) do update set value=excluded.value',[...conversationKey,conversation]);
       }
       await c.query("update assistant.jobs set status='done',finished_at=now() where family_id=$1 and id=$2", [this.familyId, job.id]);
       return reply;
@@ -213,7 +259,7 @@ export class Store {
   }
   async fail(job, text, {silent = false, weeklySave = false} = {}) {
     await this.tx(async c => {
-      const r = await c.query("update assistant.jobs set status='failed',error=$4,finished_at=now() where family_id=$1 and id=$2 and lease=$3 and status='running'", [this.familyId, job.id, job.lease, text]);
+      const r = await c.query("update assistant.jobs set status='failed',error=$4,finished_at=now() where family_id=$1 and id=$2 and lease=$3 and status='running' and lease_until>now()", [this.familyId, job.id, job.lease, text]);
       if (r.rowCount && !silent) {
         // An uncertain COMMIT can only be reported as a rollback if this job is still running.
         const reason = weeklySave ? '반복 일정 저장이 취소되어 새로 등록된 시리즈는 0건이에요.'

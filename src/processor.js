@@ -3,20 +3,12 @@ import {formatList,formatReceipt,formatDetail,groupTasks} from './format.js';
 import { listTasks, briefing } from './briefing.js';
 import { addDays, dueBriefs, kst, today } from './time.js';
 import {defaults,settingsText} from './settings.js';
-import {quickCommand,nextConversation,detailQuery,detailCandidates,selectedDetail,followup,searchTerms} from './context.js';
+import {quickCommand,nextConversation,detailQuery,detailCandidates,selectedDetail,followup,searchTerms,liveCalendarState,calendarStateKey} from './context.js';
+import { calendarContextChanged, calendarPendingNotice, isCalendarQuestionReply, isUsableCalendarReply, loadReplyReference } from './calendar-entry.js';
 
 import { buttonFor } from './buttons.js';
 import { directCompletionTarget, requestedCompletionTitle, planNatural, planWithoutTarget } from './natural.js';
 import { runNaturalWorkflow } from './assistant/workflow.js';
-
-async function loadReplyReference(job, store) {
-  if (!job.payload.replyTo) return null;
-  try { return await store.replyReference?.(JSON.parse(job.payload.replyTo).id) || null; }
-  catch (error) {
-    if (error instanceof SyntaxError) return null;
-    throw error;
-  }
-}
 
 async function isPendingAnswer(job, text, previous, reference, button, now, loadTasks) {
   if (!previous?.pending || previous.actor !== String(job.payload.actor)
@@ -69,7 +61,9 @@ async function processButton(job, store, loadTasks, now, options) {
       || Date.parse(action.expiresAt) <= +now) throw new Error('버튼이 이미 처리됐거나 만료됐어요.');
   if (action.kind === 'select') {
     const state = await store.conversation(job.payload.actor);
-    if (!state?.pending || state.requestId !== action.requestId || state.workflow?.token !== action.workflowToken) {
+    if (!state?.pending || state.requestId !== action.requestId || state.workflow?.token !== action.workflowToken
+        || (options.calendarEntry && (!liveCalendarState(state, job.payload.actor, now)
+          || state.workflow?.chatId !== String(job.payload.chatId)))) {
       throw new Error('버튼이 이미 처리됐거나 만료됐어요.');
     }
     const target = action.targets[index];
@@ -97,7 +91,34 @@ async function processButton(job, store, loadTasks, now, options) {
 }
 
 export async function processJob(job, store, ai, now = new Date(), signal, options = {}) {
-  const actorState=await store.conversation?.(job.payload.actor)||null;
+  const savedState=await store.conversation?.(job.payload.actor)||null;
+  const entry = options.calendarEntry;
+  const liveState = liveCalendarState(savedState, job.payload.actor, now);
+  const pendingState = liveState?.pending ? liveState : null;
+  const verified = entry?.kind === 'verified-followup';
+  const recent = entry?.kind === 'recent';
+  const scopedReply = !!entry && (verified || recent) && !!job.payload.replyTo;
+  const routedReference = scopedReply ? await loadReplyReference(job, store) : null;
+  const validReference = !scopedReply || (
+    isUsableCalendarReply(routedReference, job.payload, now) && routedReference.messageId === entry.replyId
+    && (verified ? isCalendarQuestionReply(routedReference, pendingState, job.payload.actor)
+      : !routedReference.pending && JSON.stringify(routedReference.taskIds) === JSON.stringify(entry.targetIds))
+  );
+  if (entry && (calendarStateKey(pendingState) !== (entry.contextKey ?? null)
+      || (entry.recentKey && calendarStateKey(liveState) !== entry.recentKey)
+      || !validReference)) {
+    throw new Error(calendarContextChanged);
+  }
+  const guard = entry && {
+    expected:entry.recentKey ?? entry.contextKey ?? null,
+    includeRecent:!!entry.recentKey,
+    preserve:!!pendingState && !verified && entry.kind !== 'button',
+    reference:routedReference
+  };
+  const actorState = !entry || entry.kind === 'button' || verified || (recent && !pendingState) ? savedState : null;
+  // The stored job keeps its original payload. A fresh Calendar plan cannot use reply context.
+  const planningJob = entry && !scopedReply && entry.kind !== 'button' && job.payload.replyTo
+    ? { ...job, payload:{ ...job.payload, replyTo:null } } : job;
   let tasks;
   const current=options.settings||defaults;
   const actorIds = actorState?.actor === String(job.payload.actor) && Date.parse(actorState.expiresAt) > +now
@@ -108,9 +129,17 @@ export async function processJob(job, store, ai, now = new Date(), signal, optio
   const buttonInput = job.payload.button ? await processButton(job, store, includeIds => readTasks({includeIds}), now, options) : null;
   if (buttonInput?.reply) return buttonInput.reply;
   const originalText = buttonInput?.action.text ?? job.payload.text.trim();
-  const naturalDetail=detailQuery(originalText);
-  let detailReplyAllowed=!job.payload.replyTo;
-  if(job.payload.replyTo&&actorState?.pending){try{const r=await store.replyReference?.(JSON.parse(job.payload.replyTo).id);detailReplyAllowed=r?.requestId===actorState.requestId&&r?.ownerActor===String(job.payload.actor)&&r?.chatId===String(job.payload.chatId)&&Date.parse(r?.expiresAt)>now.getTime();}catch{}}
+  if (entry?.target) {
+    const currentTasks = await loadTasks();
+    if (!directCompletionTarget(originalText, currentTasks)
+        || !currentTasks.some(task => task.id === entry.target.id && task.version === entry.target.version
+          && task.title.normalize('NFKC') === requestedCompletionTitle(originalText).normalize('NFKC'))) {
+      throw new Error('선택한 일정이 바뀌었어요. 현재 일정으로 다시 요청해주세요.');
+    }
+  }
+  const naturalDetail=recent ? null : detailQuery(originalText);
+  let detailReplyAllowed=entry ? verified : !job.payload.replyTo;
+  if(!entry&&job.payload.replyTo&&actorState?.pending){try{const r=await loadReplyReference(job,store);detailReplyAllowed=r?.requestId===actorState.requestId&&r?.ownerActor===String(job.payload.actor)&&r?.chatId===String(job.payload.chatId)&&Date.parse(r?.expiresAt)>now.getTime();}catch{}}
   const validDetailState=detailReplyAllowed&&actorState?.pending&&!actorState.workflow&&actorState.request?.operation==='detail'&&Date.parse(actorState.expiresAt)>now.getTime();
   const selectedId=validDetailState?selectedDetail(originalText,actorState.request)||(!/(완료|변경|바꿔|미뤄|취소|추가|등록)/.test(originalText)?detailCandidates((await loadTasks()).filter(t=>actorState.taskIds.includes(t.id)),originalText.replace(/(?:만|이요|야|요|보여줘|알려줘|볼래|선택할게)[.!\s]*$/u,'')).filter((t,i,list)=>list.length===1)[0]?.id:null):null;
   const text = quickCommand(originalText)||(selectedId?'/detail '+selectedId:naturalDetail?'/detail '+naturalDetail:originalText);
@@ -136,7 +165,7 @@ export async function processJob(job, store, ai, now = new Date(), signal, optio
     } else reply = '❓ 요청을 확인하지 못했어요\n\n일정 제목과 원하시는 작업을 말씀해주세요.';
   } else {
     const previous = buttonInput?.state || actorState;
-    const reference = await loadReplyReference(job, store);
+    const reference = entry && entry.kind !== 'button' ? (routedReference && { ...routedReference }) : await loadReplyReference(job, store);
     if (store.calendarTasks) {
       const replyIds = reference?.chatId === String(job.payload.chatId) && Date.parse(reference.expiresAt) > +now
         ? reference.taskIds ?? [] : [];
@@ -146,23 +175,25 @@ export async function processJob(job, store, ai, now = new Date(), signal, optio
         reference.taskIds = replyIds.map(id => aliases.get(id) ?? id);
       }
     }
-    const pendingAnswer = await isPendingAnswer(job, originalText, previous, reference, buttonInput, now, loadTasks);
+    const pendingAnswer = entry && entry.kind !== 'button'
+      ? verified : await isPendingAnswer(job, originalText, previous, reference, buttonInput, now, loadTasks);
     const resume = pendingAnswer && !!previous.workflow;
     if (!resume && reference?.workflowToken && reference.pending && !/추가|새로|등록/u.test(originalText)) {
       reply = '❓ 이 확인 질문은 이미 처리됐거나 다른 요청으로 바뀌었어요. 새 요청을 알려주세요.';
     } else {
-      const direct = pendingAnswer || !!buttonInput || (requestedCompletionTitle(originalText)
+      const direct = pendingAnswer || recent || !!buttonInput || (requestedCompletionTitle(originalText)
         && directCompletionTarget(originalText, await loadTasks()));
       const result = await runNaturalWorkflow({
-        ai, input:{message:{...job.payload, text:originalText}, now, settings:current}, signal, previous, resume, direct,
+        ai, input:{message:{...planningJob.payload, text:originalText}, now, settings:current}, signal, previous, resume, direct,
         planWithoutTarget:(classification, resumedIntent) => planWithoutTarget({
-          job, ai, signal, now, options, current, loadTasks, originalText, classification, previous, resumedIntent
+          job:planningJob, ai, signal, now, options, current, loadTasks, originalText, classification, previous, resumedIntent
         }),
         planWithContext:async (classification, resumedIntent) => planNatural({
-          job, store, ai, now, signal, options, current,
+          job:planningJob, store, ai, now, signal, options, current,
           tasks:classification?.cancellation && classification.cancellation.scope !== 'occurrence' ? [] : await loadTasks(),
           loadTasks, originalText,
-          previous, reference, buttonInput, classification, resumedIntent, resumed:resume
+          previous, reference, buttonInput, classification, resumedIntent, resumed:resume, verified,
+          recentScope:recent ? entry : null
         })
       });
       ({reply, changes = [], settingsChange = null, refs = [], conversation = null, retrievalReply = null, button = null} = result);
@@ -170,20 +201,27 @@ export async function processJob(job, store, ai, now = new Date(), signal, optio
       ({seriesRegistration, seriesCancellation} = result);
     }
   }
+  if (guard?.preserve && conversation?.pending && (conversation.workflow || !changes.length && !settingsChange)) {
+    await options.authorize?.();
+    signal?.throwIfAborted();
+    return store.finishSkillRouting(job, calendarPendingNotice);
+  }
   if (retrievalReply&&settingsChange&&!changes.length)reply+='\n\n✅ 알림 설정 저장 완료\n\n'+settingsText(settingsChange.after);
   if (changes.length) reply = (retrievalReply?retrievalReply+'\n\n':'')+formatReceipt(changes)+(settingsChange?'\n알림 설정\n'+settingsText(settingsChange.after):'');
   if(changes.length)refs=[...new Map([...refs,...changes.map(c=>c.after)].map(t=>[t.id,t])).values()];
   if(conversation&&(changes.length||settingsChange)){conversation.pending=false;conversation.request.question=null;}
   if(conversation)conversation.turns[conversation.turns.length-1].text=(reply||'').slice(0,1600);
   if(!conversation&&refs.length)conversation=nextConversation(job.payload.actor,originalText,reply,refs.map(t=>t.id),null,now);
+  if (entry && conversation) conversation.chatId = String(job.payload.chatId);
   if (!reply?.trim()) reply = '❓ 확인이 필요해요\n\n변경할 과업과 날짜를 알려주세요.';
   if (reply.length > 50000) reply = reply.slice(0, 49000) + '\n표시 한도를 넘었어요. 날짜·대상을 좁혀 다시 조회해주세요.';
   if (changes.some(c => c.before)) {
     button = buttonFor(job, now, {kind:'undo', changes, settings:settingsChange}, ['↩️ 방금 변경 되돌리기']);
   }
   await options.authorize?.();
+  if (entry) signal?.throwIfAborted();
   try {
-    const storedReply = await store.finish(job, changes, reply,settingsChange,{button,consumeButton:job.payload.button?.token,resumeToken,refs:refs.map(t=>({id:t.id,title:t.title})),conversation,expiresAt:new Date(now.getTime()+30*86400000).toISOString(),seriesCancellation,...seriesRegistration});
+    const storedReply = await store.finish(job, changes, reply,settingsChange,{button,consumeButton:job.payload.button?.token,resumeToken,refs:refs.map(t=>({id:t.id,title:t.title})),conversation,expiresAt:new Date(now.getTime()+30*86400000).toISOString(),seriesCancellation,...seriesRegistration,...(guard && {calendarGuard:guard})});
     return seriesRegistration ? storedReply ?? reply : reply;
   } catch (cause) {
     if (!seriesRegistration || cause.message.startsWith('확인 요청이 이미')) throw cause;

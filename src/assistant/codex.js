@@ -1,10 +1,11 @@
 import { spawn } from 'node:child_process';
-import { mkdir, writeFile, readFile, mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, writeFile, readFile, mkdtemp, rm, open } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { schema, parseAnswer, intentSchema, validateIntent } from './schema.js';
 import { kst } from '../time.js';
 import { dateTimePolicy } from './date-time-policy.js';
+import { skillRoutingPrompt, skillRoutingSchema, validateSkillRouting } from './skill-routing.js';
 
 export function childEnvironment(env = process.env) {
   // Explicit allowlist: never inherit Telegram/DB secrets, API keys, or connection URLs.
@@ -70,6 +71,26 @@ function cliError(stage, category, message) {
   return Object.assign(new Error(message), {codexFailure:{stage, category}});
 }
 
+const skillRoutingStage = 'classifySkill';
+export const skillRoutingTimeoutMs = 12000;
+
+async function readRoutingResult(resultPath) {
+  const file = await open(resultPath, 'r');
+  try {
+    const limit = 2048;
+    const buffer = Buffer.alloc(limit + 1);
+    let length = 0;
+    while (length <= limit) {
+      const { bytesRead } = await file.read(buffer, length, buffer.length - length, length);
+      if (!bytesRead) return buffer.toString('utf8', 0, length);
+      length += bytesRead;
+    }
+    throw cliError(skillRoutingStage, 'output-limit', 'AI 응답이 너무 커서 담당 기능을 확인하지 못했어요.');
+  } finally {
+    await file.close();
+  }
+}
+
 export class Codex {
   constructor(cfg) { this.cfg = cfg; }
   async answer(input, signal) {
@@ -78,24 +99,44 @@ export class Codex {
   async classify(input, signal) {
     return validateIntent(JSON.parse(await this.run(classificationPrompt(input), intentSchema, signal, 'classify')));
   }
+  async classifySkill(text, signal) {
+    const raw = await this.run(skillRoutingPrompt(text), skillRoutingSchema, signal, skillRoutingStage);
+    try {
+      return validateSkillRouting(JSON.parse(raw));
+    } catch {
+      throw cliError(skillRoutingStage, 'invalid-output', 'AI 응답 형식에서 담당 기능을 확인하지 못했어요.');
+    }
+  }
   async run(prompt, outputSchema, signal, stage) {
+    signal?.throwIfAborted();
+    const routing = stage === skillRoutingStage;
+    const timeout = routing ? (this.cfg.skillRoutingTimeout ?? skillRoutingTimeoutMs) : this.cfg.codexTimeout;
     if (Buffer.byteLength(prompt) > 500000) throw new Error('자료가 커서 AI 입력 한도를 초과했어요. 범위를 나눠주세요.');
     const base = path.join(os.tmpdir(), 'family-assistant-cli'); await mkdir(base, { recursive: true });
     const dir = await mkdtemp(path.join(base, 'request-'));
     const schemaPath = path.join(dir, 'schema.json'), resultPath = path.join(dir, 'answer.json');
-    await writeFile(schemaPath, JSON.stringify(outputSchema), 'utf8');
     const command = this.cfg.codexJs ? process.execPath : this.cfg.codexExecutable;
     const args = this.cfg.codexJs ? [this.cfg.codexJs] : [];
     args.push('exec', '--ignore-user-config', '--ignore-rules', '--ephemeral', '--skip-git-repo-check', '--sandbox', 'read-only', '-c', 'approval_policy="never"', '-c', 'features.shell_tool=false', '--output-schema', schemaPath, '-o', resultPath, '-');
     if (this.cfg.model) args.splice(args.length - 1, 0, '-m', this.cfg.model);
+    if (routing) args.splice(args.length - 1, 0, '-c', 'web_search="disabled"', '-c', 'features.plugins=false', '-c', 'features.hooks=false', '-c', 'features.apps=false');
     try {
+      await writeFile(schemaPath, JSON.stringify(outputSchema), 'utf8');
+      signal?.throwIfAborted();
       await new Promise((resolve, reject) => {
-        const combined = signal ? AbortSignal.any([signal, AbortSignal.timeout(this.cfg.codexTimeout)]) : AbortSignal.timeout(this.cfg.codexTimeout);
+        const deadline = AbortSignal.timeout(timeout);
+        const combined = signal ? AbortSignal.any([signal, deadline]) : deadline;
         const child = spawn(command, args, { cwd: dir, env: childEnvironment(), windowsHide: true, shell: false, stdio: ['pipe','pipe','pipe'] });
-        let output = 0, ended = false, stderr = '';
+        let output = 0, ended = false, stopping = false, stderr = '';
         const stop = () => {
-          if (process.platform === 'win32' && child.pid) spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' }).on('error', () => child.kill());
-          else child.kill('SIGKILL');
+          if (stopping) return;
+          stopping = true;
+          if (process.platform === 'win32' && child.pid) {
+            const killChild = () => { if (!ended) child.kill('SIGKILL'); };
+            spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' })
+              .once('error', killChild)
+              .once('close', code => { if (code !== 0) killChild(); });
+          } else child.kill('SIGKILL');
         };
         const abort = () => stop(); combined.addEventListener('abort', abort, { once: true });
         if (combined.aborted) stop();
@@ -112,7 +153,7 @@ export class Codex {
         });
         child.on('close', code => {
           combined.removeEventListener('abort', abort); if (ended) return; ended = true;
-          if (combined.aborted) reject(cliError(stage, 'aborted', 'AI 작업 시간이 초과됐거나 실행 권한이 만료됐어요. 저장하지 않았어요.'));
+          if (combined.aborted) reject(cliError(stage, routing && deadline.aborted && !signal?.aborted ? 'timeout' : 'aborted', 'AI 작업 시간이 초과됐거나 실행 권한이 만료됐어요. 저장하지 않았어요.'));
           else if (code !== 0 || output > 8 * 1024 * 1024) reject(cliError(stage,
             output > 8 * 1024 * 1024 ? 'output-limit' : cliFailure(stderr),
             'Codex 실행 실패. 로컬 로그인·사용 한도·CLI 버전을 확인하세요.'));
@@ -120,7 +161,7 @@ export class Codex {
         });
         child.stdin.end(prompt);
       });
-      return await readFile(resultPath, 'utf8');
+      return routing ? await readRoutingResult(resultPath) : await readFile(resultPath, 'utf8');
     } finally { await rm(dir, { recursive: true, force: true }); }
   }
 }
