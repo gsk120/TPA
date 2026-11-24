@@ -233,9 +233,12 @@ async function run(pool) {
   }
   if (command==='review') {
     const state=await connection(pool);
+    const skipInitial=args.includes('--skip-initial');
+    const eventId=args.find(arg=>arg!=='--private' && arg!=='--skip-initial')??null;
     const rows=(await pool.query(`select * from assistant.calendar_sync_inbox where family_id=$1 and connection_id=$2
       and (state='held' or state='applied' and google_event_id=$3) and ($3::text is null or google_event_id=$3)
-      limit 100`,[...connectionArgs(state),args.find(arg=>arg!=='--private')??null])).rows;
+      and (not $4::boolean or result_code is distinct from 'initial_review')
+      limit 100`,[...connectionArgs(state),eventId,skipInitial])).rows;
     return rows.map(row=>{
       const event=readInboxEvent(state,row);
       return {id:event.id,reason:row.result_code,approval:fingerprint(row,event),

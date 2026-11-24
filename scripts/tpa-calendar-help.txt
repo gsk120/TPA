@@ -3,7 +3,7 @@
   mode paused|preview|inbound|bidirectional
   preview [--since YYYY-MM-DD] [--private]
   instances EVENT_ID --since YYYY-MM-DD --until YYYY-MM-DD
-  review [EVENT_ID] [--private]
+  review [EVENT_ID] [--private] [--skip-initial]
   import EVENT_ID APPROVAL [--private-title]
   import-read-only EVENT_ID APPROVAL [--private-title]
   link EVENT_ID APPROVAL TPA_ID VERSION
@@ -15,4 +15,5 @@ The calendar worker runs inside the bot process.
 Use "mode paused" to pause calendar sync while keeping the bot running.
 Omit APPROVAL on unlink or undo-import to preview the impact.
 Use --private-title to hide the Google event title in TPA.
+Use review --skip-initial to hide initial_review items.
 After detachment, use preview for a fresh approval and import, import-read-only, or link to reconnect.
