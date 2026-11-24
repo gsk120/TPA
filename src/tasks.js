@@ -1,11 +1,12 @@
 import { randomUUID } from 'node:crypto';
-import { timeTypes, validClock, validDay, validInstant, validTimeZone } from './time.js';
+import { wallInstants, wallTime } from './recurrence.js';
+import { TIME_ZONE, timeTypes, validClock, validDay, validInstant, validTimeZone } from './time.js';
 
 export const kinds = ['task', 'decision', 'appointment', 'registration', 'event'];
 export const statuses = ['open', 'in_progress', 'waiting', 'done', 'cancelled'];
 const fields = ['title', 'kind', 'status', 'dueDate', 'time', 'endDate', 'timeNote', 'person', 'assignee', 'notes', 'followUpDate', 'actualDeadline', 'remindAt'];
 const timingFields = ['dueDate','time','endDate','timeNote','timeType','endTime','sourceTimeZone'];
-export const isActive = task => !['done', 'cancelled'].includes(task.status);
+export const isActive = task => ['open', 'in_progress', 'waiting'].includes(task.status);
 export function validateTask(input, now = new Date()) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('과업 형식을 확인하세요.');
   const task = {};
@@ -51,15 +52,40 @@ export function planTaskCreation(input, reason, now) {
     reason
   };
 }
-export function planChanges(actions, currentTasks, now = new Date()) {
+function moveStoredRange(previous, proposed, zone) {
+  if (previous.timeType !== 'range' || proposed.endTime != null ||
+      proposed.endDate != null && proposed.endDate !== previous.endDate ||
+      ![null,undefined,'timed','range'].includes(proposed.timeType) ||
+      !validDay(proposed.dueDate) || !validClock(proposed.time) ||
+      proposed.dueDate === previous.dueDate && proposed.time === previous.time) return;
+  const timing = previous.recurrence?.timing;
+  const oldStart = timing ? Date.parse(timing.start) : wallInstants(previous.dueDate+'T'+previous.time+':00',zone)[0];
+  const oldEnd = timing ? Date.parse(timing.end ?? '') :
+    wallInstants((previous.endDate ?? previous.dueDate)+'T'+previous.endTime+':00',zone).find(end => end > oldStart);
+  const seconds = timing && Number.isFinite(oldStart) ? wallTime(oldStart,zone).slice(16) : ':00';
+  const [start] = wallInstants(proposed.dueDate+'T'+proposed.time+seconds,zone);
+  if (!Number.isFinite(start) || !(oldEnd > oldStart)) throw new Error('일정의 시작 시각과 기존 일정 길이를 확인해주세요.');
+  const end = start + (oldEnd - oldStart);
+  const localEnd = wallTime(end,zone);
+  const endDate = localEnd.slice(0,10);
+  Object.assign(proposed,{timeType:'range',endTime:localEnd.slice(11,16),
+    endDate:endDate !== proposed.dueDate || previous.endDate === previous.dueDate ? endDate : null,
+    sourceTimeZone:previous.sourceTimeZone ?? null});
+  if (timing) return {start:new Date(start).toISOString(),end:new Date(end).toISOString()};
+}
+
+export function planChanges(actions, currentTasks, now = new Date(), timeZone = TIME_ZONE) {
   if (!Array.isArray(actions) || actions.length > 20) throw new Error('한 번에 최대 20개를 변경할 수 있습니다.');
   const map = new Map(currentTasks.map(t => [t.id, structuredClone(t)]));
   const changes = [], seen = new Set();
   for (const action of actions) {
     if (!['create', 'update'].includes(action.operation)) throw new Error('지원하지 않는 변경입니다.');
     const previous = action.operation === 'update' ? map.get(action.id) : null;
+    if (previous?.recurrence?.readOnly) throw new Error('Google에서 가져온 읽기 전용 반복 일정입니다. Google Calendar에서 변경해주세요.');
     const proposed = { ...action.task };
+    let restoreTiming;
     if (previous && Array.isArray(proposed.remindAt)) {
+      restoreTiming = moveStoredRange(previous,proposed,previous.recurrence?.timeZone ?? timeZone);
       if (proposed.timeType == null && proposed.time === previous.time && proposed.timeNote === previous.timeNote) {
         proposed.timeType = previous.timeType;
       }
@@ -84,7 +110,7 @@ export function planChanges(actions, currentTasks, now = new Date()) {
       for (const key of ['timeType','endTime','sourceTimeZone']) {
         if (!Object.hasOwn(data,key)) delete next[key];
       }
-      changes.push({ before: old, after: next, reason: action.reason || '' }); map.set(next.id, next);
+      changes.push({ before: old, after: next, reason: action.reason || '', ...(restoreTiming && {restoreTiming}) }); map.set(next.id, next);
     }
   }
   return changes;

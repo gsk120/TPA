@@ -53,11 +53,11 @@ export function parseRule(lines, allDay) {
   for (const field of lines[0].slice(6).split(';')) {
     const [name, value, extra] = field.split('=');
     if (extra !== undefined || !value || fields.has(name)
-      || !['FREQ','INTERVAL','COUNT','UNTIL','BYDAY','BYMONTHDAY','WKST'].includes(name)) failRule();
+      || !['FREQ','INTERVAL','COUNT','UNTIL','BYDAY','BYMONTH','BYMONTHDAY','WKST'].includes(name)) failRule();
     fields.set(name, value);
   }
   const frequency = fields.get('FREQ');
-  if (!['DAILY','WEEKLY','MONTHLY'].includes(frequency)) failRule();
+  if (!['DAILY','WEEKLY','MONTHLY','YEARLY'].includes(frequency)) failRule();
   const interval = fields.has('INTERVAL') ? integer(fields.get('INTERVAL'), 1000000) : 1;
   const count = fields.has('COUNT') ? integer(fields.get('COUNT'), 2147483647) : null;
   const rawUntil = fields.get('UNTIL');
@@ -74,8 +74,11 @@ export function parseRule(lines, allDay) {
     if (!/^-?\d{1,2}$/.test(day) || !Number(day) || Math.abs(Number(day)) > 31) failRule();
     return Number(day);
   });
-  if (byMonthDay && frequency !== 'MONTHLY') failRule();
-  return {frequency, interval, count, until, byDay, byMonthDay, weekStart};
+  const byMonth=fields.has('BYMONTH') ? integer(fields.get('BYMONTH'),12) : null;
+  if (byMonth!==null && frequency!=='YEARLY') failRule();
+  if (byMonthDay && frequency!=='MONTHLY' &&
+      !(frequency==='YEARLY' && byMonth!==null && byMonthDay.length===1 && byMonthDay[0]>0)) failRule();
+  return {frequency, interval, count, until, byDay, byMonthDay, byMonth, weekStart};
 }
 
 const iso = value => new Date(value).toISOString();
@@ -103,10 +106,13 @@ export function occurrenceWindow(today, from, to) {
   return {first,last:validDay(to) ? to : calendarDay(first,ALL_OCCURRENCES_DAYS - 1)};
 }
 
-export function withinOccurrenceWindow(task, {first,last}) {
-  const end = task.timeType === 'range' && task.endTime === '00:00' && task.endDate > task.dueDate
+export function lastScheduleDay(task) {
+  return task.timeType === 'range' && task.endTime === '00:00' && task.endDate > task.dueDate
     ? calendarDay(task.endDate,-1) : task.endDate ?? task.dueDate;
-  return Boolean(task.dueDate && task.dueDate <= last && end >= first);
+}
+
+export function withinOccurrenceWindow(task, {first,last}) {
+  return Boolean(task.dueDate && task.dueDate <= last && lastScheduleDay(task) >= first);
 }
 
 export const isDateAnchored = series => series.all_day || ['unknown','condition','date_only'].includes(series.time_type);
@@ -131,12 +137,22 @@ export function validateSeries(series) {
   const rule = parseRule(series.recurrence_raw, dateAnchored);
   const anchor = dateAnchored ? start_date : wallTime(Date.parse(start_at), series.timezone).slice(0, 10);
   if ((rule.byDay && !rule.byDay.includes(weekday(anchor)))
+    || (rule.byMonth!==null && rule.byMonth!==Number(anchor.slice(5,7)))
     || (rule.byMonthDay && !monthDays(monthNumber(anchor), rule.byMonthDay).includes(anchor))
     || (rule.until && (dateAnchored ? rule.until < anchor : Date.parse(rule.until) < Date.parse(start_at)))) failRule();
 }
 
 function* candidateDays(start, from, to, rule) {
   const {frequency, interval, weekStart, byDay, byMonthDay} = rule;
+  if (frequency==='YEARLY') {
+    const year=Number(start.slice(0,4));
+    const firstYear=year+Math.max(0,Math.floor((Number(from.slice(0,4))-year)/interval))*interval;
+    for (let y=firstYear;y<=Number(to.slice(0,4));y+=interval) {
+      const day=String(y).padStart(4,'0')+start.slice(4);
+      if (day>=start && day<=to && validDay(day)) yield day;
+    }
+    return;
+  }
   if (frequency === 'MONTHLY') {
     const beginning = monthNumber(start);
     const wanted = byMonthDay ?? [Number(start.slice(8))];

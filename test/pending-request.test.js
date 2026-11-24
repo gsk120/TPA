@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {processJob} from '../src/processor.js';
+import {inspectCalendarEntry} from '../src/calendar-entry.js';
 import {selectContext,nextConversation,validateClarification} from '../src/context.js';
 import {buildPrompt} from '../src/assistant/codex.js';
 const now=new Date('2026-11-02T14:30:00Z');
@@ -104,9 +105,35 @@ test('date selection rechecks that an earlier rescheduling candidate is active',
  assert.deepEqual(h.state.taskIds.sort(),[snap.id,place.id].sort());
  tasks = [{...tasks[0],status:'done',version:2},tasks[1]];
  await processJob({payload:payload('11월 5일 거')},store,{answer},new Date(+now+60000));
- assert.match(h.saved[1].reply,/그 날짜나 시각에 해당하는 일정을 찾지 못했어요/);
+ assert.match(h.saved[1].reply,/확인하는 동안 대상 일정이 바뀌었어요/);
  assert.deepEqual(h.saved[1].changes,[]);
- assert.deepEqual(h.state.taskIds,[place.id]);
+ assert.equal(h.state.pending,false);
+});
+
+test('same-title cancellation ignores closed items and confirms only truly indistinguishable active matches',async()=>{
+ const title='Google 일정';
+ const h=harness();
+ let tasks=[{...snap,title,status:'cancelled'},{...place,title,status:'in_progress'},
+   {...snap,id:'deleted-task',title,status:'deleted'}];
+ const store={...h.store,tasks:async()=>tasks};
+ const classify=async()=>({intent:'cancel',targets:[title],answer:null});
+ const cancel=task=>({operation:'update',id:task.id,expectedVersion:task.version,
+   task:{...task,status:'cancelled'},reason:'취소'});
+ const job=text=>({payload:payload(text)});
+ await processJob(job(title+' 둘 다 취소해줘'),store,{classify,answer:async input=>{
+   assert.deepEqual(input.tasks.map(task=>task.id),[place.id]);
+   return {actions:input.tasks.map(cancel)};
+ }},now);
+ assert.deepEqual(h.saved[0].changes.map(change=>change.after.id),[place.id]);
+ tasks=[{...snap,title},{...place,title,status:'waiting'}];
+ await processJob(job(title+' 취소해줘'),store,{classify,answer:async()=>assert.fail('must confirm identical matches')},now);
+ assert.match(h.saved[1].reply,/활성 일정이 2건.*모두 적용할까요/);
+ assert.equal((await inspectCalendarEntry({job:job('네'),store,now:new Date(+now+60000)})).kind,'verified-followup');
+ await processJob(job('네'),store,{answer:async input=>{
+   assert.deepEqual(input.tasks.map(task=>task.id),[snap.id,place.id]);
+   return {actions:input.tasks.map(cancel)};
+ }},new Date(+now+60000));
+ assert.deepEqual(h.saved[2].changes.map(change=>change.after.id),[snap.id,place.id]);
 });
 
 

@@ -5,20 +5,24 @@ import {timeTypes,validClock,validDay,validTimeZone} from './time.js';
 const weekdays = '일월화수목금토';
 const dateWeekday = day => new Date(day + 'T00:00:00Z').getUTCDay();
 const formatError = () => new Error('AI 응답의 반복 일정 규칙을 확인하지 못했어요. 다시 말씀해주세요.');
-const seriesDraftFields = ['title','frequency','weekday','monthDay','start','end','time','allDay',
+const seriesDraftFields = ['title','frequency','weekday','monthDay','yearMonth','calendarSystem','start','end','time','allDay',
   'timeType','endTime','endDayOffset','timeNote','timeZone'];
+const annualDate=(year,month,day)=>String(year).padStart(4,'0')+'-'+String(month).padStart(2,'0')+'-'+String(day).padStart(2,'0');
 
 export function readSeriesDraft(input) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw formatError();
-  const {title=null,frequency=null,weekday=null,monthDay=null,start=null,end=null,time=null,allDay=null,
+  const {title=null,frequency=null,weekday=null,monthDay=null,yearMonth=null,calendarSystem=null,start=null,end=null,time=null,allDay=null,
     timeType=allDay === true ? 'all_day' : allDay === false ? 'timed' : null,
     endTime=null,endDayOffset=null,timeNote=null,timeZone=null} = input;
   if (Object.keys(input).some(key => !seriesDraftFields.includes(key))
       || title !== null && (typeof title !== 'string' || !title.trim() || title.length > 300)
-      || frequency !== null && !['DAILY','WEEKLY','MONTHLY'].includes(frequency)
+      || frequency !== null && !['DAILY','WEEKLY','MONTHLY','YEARLY'].includes(frequency)
       || weekday !== null && (frequency !== 'WEEKLY' || !Number.isInteger(weekday) || weekday < 0 || weekday > 6)
-      || monthDay !== null && (frequency !== 'MONTHLY' || !Number.isInteger(monthDay)
-        || monthDay < -1 || monthDay === 0 || monthDay > 31)
+      || monthDay !== null && (!['MONTHLY','YEARLY'].includes(frequency) || !Number.isInteger(monthDay)
+        || monthDay < (frequency==='YEARLY'?1:-1) || monthDay === 0 || monthDay > 31)
+      || yearMonth !== null && (frequency!=='YEARLY' || !Number.isInteger(yearMonth) || yearMonth<1 || yearMonth>12)
+      || calendarSystem !== null && (frequency!=='YEARLY' || !['solar','lunar'].includes(calendarSystem))
+      || calendarSystem==='solar' && yearMonth!==null && monthDay!==null && !validDay(annualDate(2000,yearMonth,monthDay))
       || start !== null && !validDay(start) || end !== null && !validDay(end)
       || time !== null && !validClock(time)
       || allDay !== null && typeof allDay !== 'boolean'
@@ -31,7 +35,8 @@ export function readSeriesDraft(input) {
       || timeType === 'range' && !endDayOffset && time && endTime && endTime <= time
       || timeNote !== null && (typeof timeNote !== 'string' || timeNote.length > 300)
       || timeZone !== null && !validTimeZone(timeZone)) throw formatError();
-  return {title:title?.trim() ?? null,frequency,weekday,monthDay,start,end,time,timeType,endTime,endDayOffset,
+  return {title:title?.trim() ?? null,frequency,weekday,monthDay,...(frequency==='YEARLY'&&{yearMonth,calendarSystem}),
+    start,end,time,timeType,endTime,endDayOffset,
     timeNote:timeNote?.trim() || null,timeZone};
 }
 
@@ -41,6 +46,8 @@ export function missingSeriesFields(fields) {
   if (!fields.frequency) missing.push('반복 주기');
   if (fields.frequency === 'WEEKLY' && fields.weekday === null) missing.push('요일');
   if (fields.frequency === 'MONTHLY' && fields.monthDay === null) missing.push('매월 날짜');
+  if (fields.frequency==='YEARLY' && (!fields.yearMonth || !fields.monthDay)) missing.push('매년 반복할 월·일');
+  if (fields.frequency==='YEARLY' && !fields.calendarSystem) missing.push('양력·음력 구분');
   if (fields.timeType === null || ['timed','range'].includes(fields.timeType) && !fields.time) {
     missing.push('시각 또는 종일 여부');
   }
@@ -49,12 +56,26 @@ export function missingSeriesFields(fields) {
   return missing;
 }
 
+function nextAnnualDay(fields,from) {
+  if (!validDay(from)) return null;
+  for (let year=Number(from.slice(0,4));year<=9999;year++) {
+    const day=annualDate(year,fields.yearMonth,fields.monthDay);
+    if (day>=from && validDay(day)) return day;
+  }
+  return null;
+}
+
 function buildSeries(fields, requestedAt, timeZone) {
   const today = wallTime(+requestedAt,timeZone).slice(0,10);
   const dateAnchored = !['timed','range'].includes(fields.timeType);
   let day = fields.start && fields.start > today ? fields.start : today;
   if (fields.frequency === 'WEEKLY') {
     day = calendarDay(day,(fields.weekday - dateWeekday(day) + 7) % 7);
+  }
+  const yearly=fields.frequency==='YEARLY';
+  if (yearly) {
+    if (fields.calendarSystem!=='solar' || !fields.yearMonth || !fields.monthDay) throw formatError();
+    day=nextAnnualDay(fields,day);
   }
   const step = fields.frequency === 'WEEKLY' ? 7 : 1;
   while (validDay(day) && (!fields.end || day <= fields.end)) {
@@ -90,7 +111,8 @@ function buildSeries(fields, requestedAt, timeZone) {
       validateSeries(series);
       return {series,first:day};
     }
-    day = calendarDay(day,step);
+    const next=calendarDay(day,step);
+    day = yearly ? nextAnnualDay(fields,next) : next;
   }
   return null;
 }
@@ -110,12 +132,14 @@ export function planSeriesRegistration(fields, requestedAt, familyTimeZone, acto
   if (more) preview.pop();
   const timeLabel = {
     all_day:'종일',unknown:fields.timeNote || '시간 미정',condition:fields.timeNote,date_only:'마감',
-    timed:fields.time,range:fields.time + ' ~ ' + (fields.endDayOffset ? fields.endDayOffset + '일 후 ' : '') + fields.endTime
+    timed:fields.time,range:fields.time
   }[fields.timeType];
   const reply = '✅ 반복 일정 시리즈 등록 · ' + series.title + '\n\n'
     + preview.map(anchor => {
       const day = anchor.slice(0,10);
-      return '• ' + day + ' (' + weekdays[dateWeekday(day)] + ') ' + timeLabel;
+      const lastDayOffset = (fields.endDayOffset ?? 0) - (fields.endTime === '00:00' ? 1 : 0);
+      const period = lastDayOffset > 0 ? ' · ' + day + '~' + calendarDay(day,lastDayOffset) : '';
+      return '• ' + day + ' (' + weekdays[dateWeekday(day)] + ') ' + timeLabel + period;
     }).join('\n')
     + (!fields.end ? '\n\n종료일 없이 반복해요. 위에는 첫 회차를 표시했어요.'
       : more ? '\n\n앞의 ' + limit + '개 회차를 표시했어요.' : '\n\n회차 ' + preview.length + '건');
@@ -125,6 +149,7 @@ export function planSeriesRegistration(fields, requestedAt, familyTimeZone, acto
   const identity = [String(actor),timeZone,fields.start,fields.end,
     weekly ? fields.weekday : fields.frequency,fields.title,fields.timeType === 'all_day' ? '종일' : fields.time];
   if (!weekly) identity.push(fields.monthDay);
+  if (fields.frequency==='YEARLY') identity.push(fields.yearMonth);
   if (!['all_day','timed'].includes(fields.timeType) || fields.timeNote) {
     identity.push(fields.timeType,fields.endTime,fields.endDayOffset || null,fields.timeNote);
   }

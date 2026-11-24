@@ -3,7 +3,7 @@ import {formatList,formatReceipt,formatDetail,groupTasks} from './format.js';
 import { listTasks, briefing } from './briefing.js';
 import { addDays, dueBriefs, kst, today } from './time.js';
 import {defaults,settingsText} from './settings.js';
-import {quickCommand,nextConversation,detailQuery,detailCandidates,selectedDetail,followup,searchTerms,liveCalendarState,calendarStateKey} from './context.js';
+import {allCandidateDecision,quickCommand,nextConversation,detailQuery,detailCandidates,selectedDetail,followup,searchTerms,liveCalendarState,calendarStateKey} from './context.js';
 import { calendarContextChanged, planCalendarPending, inspectCalendarEntry, isCalendarQuestionReply, isUsableCalendarReply, loadReplyReference, pendingConfirmationAction } from './calendar-entry.js';
 
 import { buttonFor } from './buttons.js';
@@ -25,6 +25,7 @@ async function isPendingAnswer(job, text, previous, reference, button, now, load
       && reference.ownerActor === String(job.payload.actor) && reference.chatId === String(job.payload.chatId)
       && Date.parse(reference.expiresAt) > +now;
   }
+  if (previous.request?.confirmAllCandidates) return !!allCandidateDecision(text);
   const namedCommand = /완료|변경|바꿔|미뤄|취소|삭제|수정|조회|보여|알려/u.test(text) && searchTerms(text).length;
   if (previous.request?.dateCompletion && !namedCommand) {
     return !previous.request.dateCompletion.targets && text.length <= 80
@@ -82,6 +83,7 @@ async function processButton(job, store, loadTasks, now, options) {
     if (!current) throw new Error('되돌릴 수 없어요. 요청에 포함된 일정이 그사이 다시 변경됐어요.');
     const restored = before || {...current, status:'cancelled', completedAt:null, remindAt:[]};
     return {before:current, after:{...restored, version:current.version + 1, updatedAt:now.toISOString()}, reason:'변경 되돌리기',
+      ...(before && current.status==='cancelled' && restored.status!=='cancelled' && {restoreCancellation:true}),
       ...(current.recurrence ? {restoreTiming:restored.recurrence?.timing} : {})};
   });
   const settings = action.settings && {
@@ -162,6 +164,16 @@ export async function planCalendarJob(job, store, ai, now = new Date(), signal, 
     else if(name==='settings')reply=arg?'알림 변경은 자연어로 말씀해주세요. 예: 매일 알림을 오전 7시 반으로 바꿔줘':'⚙️ 알림 설정\n\n'+settingsText(current);
     else if(name==='start')reply='안녕하세요, 토비예요. 비공개 가족방에서 !로 시작하거나 제 메시지에 답장해 부탁해주세요.';
     else if(name==='help')reply=help;
+    else if(name==='calendarsync') {
+      const state=await store.calendarSyncStatus?.();
+      const labels={preview:'미리보기',inbound:'가져오기',bidirectional:'양방향',paused:'일시정지'};
+      reply=state ? [
+        'Google Calendar 동기화 '+labels[state.mode],
+        '최근 성공 '+(state.last_success_at ? kst(new Date(state.last_success_at),current.timeZone).slice(0,16).replace('T',' ') : '기록 없음'),
+        '수신 대기·보류 '+state.incoming+'건, 발신 대기·보류 '+state.outstanding+'건, 충돌 '+state.conflicts+'건',
+        ...(state.last_error_code ? [['401','403'].includes(state.last_error_code)?'Google 인증 또는 권한을 확인해주세요.':'최근 동기화에 오류가 있었어요.'] : [])
+      ].join('\n') : '이 가족방에는 Google Calendar 동기화가 연결되어 있지 않아요.';
+    }
     else if (['today','week','list'].includes(name)) {
       const day = today(now,current.timeZone);
       const range = name === 'list' ? {} : {from:day,to:name === 'today' ? day : addDays(day,6)};

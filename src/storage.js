@@ -5,8 +5,28 @@ import { randomUUID, createHash } from 'node:crypto';
 import { applyOccurrenceChange, createScheduleSeries, hasScheduleSchema, linkScheduleOccurrence, lockRegistrationSeries, readActiveScheduleSeries, readCalendarTasks, updateScheduleSeries } from './schedule-store.js';
 import { occurrenceId } from './recurrence.js';
 import { addScheduleBackup, restoreFamilyBackup } from './schedule-backup.js';
+import { queueCalendarChange } from './calendar-sync/outbox.js';
 import { calendarStateKey, isPendingInChat, liveCalendarState } from './context.js';
 import { jobDebug } from './diagnostics.js';
+import { isActive } from './tasks.js';
+
+export async function persistTaskChange(c,familyId,actor,{before,after,reason,requireActive,restoreCancellation},{origin='local'}={}) {
+  if (before) {
+    if (requireActive && !isActive(before)) throw new Error('선택한 일정이 이미 완료됐거나 취소됐어요.');
+    const updated = await c.query(`update assistant.tasks set version=$4,data=$5 where family_id=$1 and id=$2 and version=$3
+      ${requireActive ? "and data->>'status'=$6" : ''}`,
+      [familyId,after.id,before.version,after.version,after,...(requireActive ? [before.status] : [])]);
+    if (!updated.rowCount) throw new Error('다른 작업에서 목록이 변경됐습니다. 다시 요청해주세요.');
+    await c.query("update assistant.deliveries set status='cancelled' where family_id=$1 and task_id=$2 and status='pending'",
+      [familyId,after.id]);
+  } else {
+    await c.query('insert into assistant.tasks(family_id,id,version,data) values($1,$2,$3,$4)',
+      [familyId,after.id,after.version,after]);
+  }
+  await c.query('insert into assistant.history(family_id,actor,task_id,before_data,after_data,reason) values($1,$2,$3,$4,$5,$6)',
+    [familyId,String(actor),after.id,before,after,reason]);
+  await queueCalendarChange(c,familyId,'task',before,after,{origin,restoreCancellation});
+}
 
 export class Store {
   constructor(pool, familyId) { this.pool = pool; this.familyId = familyId; }
@@ -50,6 +70,20 @@ export class Store {
   }
   async close() { if (this.lock) { await this.lock.query('select pg_advisory_unlock_all()').catch(() => {}); this.lock.release(); } await this.pool.end(); }
   async tasks() { return (await this.pool.query('select data from assistant.tasks where family_id=$1 order by id', [this.familyId])).rows.map(r => r.data); }
+  async calendarSyncStatus() {
+    if (process.env.CALENDAR_SYNC_ENABLED !== 'true' ||
+        process.env.CALENDAR_SYNC_FAMILY_ID?.toLowerCase() !== this.familyId.toLowerCase()) return null;
+    if (!(await this.pool.query("select to_regclass('assistant.calendar_sync_state') as name")).rows[0].name) return null;
+    return (await this.pool.query(`select s.mode,s.last_success_at,s.last_error_code,
+      (select count(*)::int from assistant.calendar_sync_outbox o where o.family_id=s.family_id and o.connection_id=s.id
+        and o.state in ('pending','sending','uncertain','held','failed')) as outstanding,
+      (select count(*)::int from assistant.calendar_sync_conflicts x where x.family_id=s.family_id and x.connection_id=s.id
+        and x.state='open') as conflicts,
+      (select count(*)::int from assistant.calendar_sync_inbox i where i.family_id=s.family_id and i.connection_id=s.id
+        and i.state in ('pending','held')) as incoming
+      from assistant.calendar_sync_state s where s.family_id=$1 and s.calendar_id=$2`,
+    [this.familyId,process.env.GOOGLE_CALENDAR_ID])).rows[0] ?? null;
+  }
   async calendarTasks(options) {
     jobDebug('db.calendar-tasks.read');
     if (!await hasScheduleSchema(this.pool)) return this.tasks();
@@ -221,7 +255,7 @@ export class Store {
       if (memory?.seriesCancellation) {
         if (changes.length || settingsChange || memory.series) throw new Error('반복 일정 취소와 다른 변경이 섞였어요.');
         const {id, version} = memory.seriesCancellation;
-        await updateScheduleSeries(c,this.familyId,id,version,{status:'cancelled'},job.payload.actor);
+        await updateScheduleSeries(c,this.familyId,id,version,{status:'cancelled'},job.payload.actor,{requireActive:true});
       }
       if (memory?.series) {
         if (changes.some(change => !change.before)) throw new Error('반복 일정과 개별 일정은 함께 등록할 수 없어요.');
@@ -271,12 +305,7 @@ export class Store {
           await applyOccurrenceChange(c,this.familyId,job.payload.actor,change);
           continue;
         }
-        if (before) {
-          const update = await c.query('update assistant.tasks set version=$4,data=$5 where family_id=$1 and id=$2 and version=$3', [this.familyId, after.id, before.version, after.version, after]);
-          if (!update.rowCount) throw new Error('다른 작업에서 목록이 변경됐습니다. 다시 요청해주세요.');
-          await c.query("update assistant.deliveries set status='cancelled' where family_id=$1 and task_id=$2 and status='pending'", [this.familyId, after.id]);
-        } else await c.query('insert into assistant.tasks(family_id,id,version,data) values($1,$2,$3,$4)', [this.familyId, after.id, after.version, after]);
-        await c.query('insert into assistant.history(family_id,actor,task_id,before_data,after_data,reason) values($1,$2,$3,$4,$5,$6)', [this.familyId, String(job.payload.actor), after.id, before, after, change.reason]);
+        await persistTaskChange(c,this.familyId,job.payload.actor,change);
       }
       await c.query('insert into assistant.context(family_id,actor,text,reply_to) values($1,$2,$3,$4),($1,$5,$6,null)', [this.familyId, String(job.payload.actor), job.payload.text.slice(0, 8000), job.payload.replyTo || null, 'assistant', reply.slice(0, 16000)]);
       await c.query('delete from assistant.context where family_id=$1 and id not in (select id from assistant.context where family_id=$1 order by id desc limit 40)', [this.familyId]);

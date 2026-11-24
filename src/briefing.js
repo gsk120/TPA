@@ -1,4 +1,5 @@
 import { today, addDays } from './time.js';
+import { lastScheduleDay } from './recurrence.js';
 import { isActive } from './tasks.js';
 import {groupTasks,dateLabel} from './format.js';
 
@@ -11,8 +12,8 @@ export function listTasks(tasks, mode = 'all', now = new Date(), timeZone = 'Asi
 export function briefing(tasks, type, now = new Date(), history = [], timeZone = 'Asia/Seoul') {
   const day = today(now,timeZone), tomorrow = addDays(day, 1), end = addDays(day, type === 'weekly' ? 14 : 1);
   const active = listTasks(tasks, 'all', now,timeZone);
-  const overdue = active.filter(t => t.dueDate && (t.endDate || t.dueDate) < day);
-  const upcoming = active.filter(t => t.dueDate && ((t.dueDate >= day && t.dueDate <= end) || (t.endDate && t.dueDate < day && t.endDate >= day)));
+  const overdue = active.filter(t => t.dueDate && lastScheduleDay(t) < day);
+  const upcoming = active.filter(t => t.dueDate && t.dueDate <= end && lastScheduleDay(t) >= day);
   const show = entries => entries.length ? groupTasks(entries,{now,timeZone,showOverdue:false}) : '없어요.';
   let text = `📅 ${type === 'weekly' ? '주간' : '일일'}점검 · ${dateLabel(day)}\n기준 시간대: ${timeZone}\n\n`;
   if (type === 'daily') {

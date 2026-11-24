@@ -6,6 +6,21 @@ TPA_NODE_DIR=/Users/ibksystem/.local/share/tpa-tools/node-v22.23.4-darwin-x64
 TPA_CODEX_DIR=/Users/ibksystem/.local/share/tpa-tools/codex
 TPA_NODE="$TPA_NODE_DIR/bin/node"
 TPA_NPM="$TPA_NODE_DIR/lib/node_modules/npm/bin/npm-cli.js"
+case "${1:-help}" in
+  help|-h|--help)
+    printf '%s\n' 'Usage: ./tpa start|stop|restart|status|logs [lines]|follow|versions' \
+      '       ./tpa npm <arguments>' '       ./tpa calendar help'
+    exit 0
+    ;;
+  calendar)
+    case "${2:-help}" in
+      help|-h|--help)
+        printf '%s\n\n' 'Usage: ./tpa calendar <command> [arguments]'
+        exec cat "$TPA_ROOT/scripts/tpa-calendar-help.txt"
+        ;;
+    esac
+    ;;
+esac
 if [ ! -x "$TPA_NODE" ] || [ ! -r "$TPA_NPM" ]; then
   echo 'TPA 전용 Node.js/npm 설치 경로를 확인하세요.' >&2
   exit 1
@@ -32,14 +47,14 @@ case "${1:-help}" in
     shift
     exec "$TPA_NODE" "$TPA_NPM" "$@"
     ;;
+  calendar)
+    shift
+    exec "$TPA_NODE" --env-file=.env src/calendar-sync/manage.js "$@"
+    ;;
   versions)
     "$TPA_NODE" --version
     "$TPA_NODE" "$TPA_NPM" --version
     exec "$TPA_NODE" "$TPA_CODEX_DIR/lib/node_modules/@openai/codex/bin/codex.js" --version
-    ;;
-  help|-h|--help)
-    echo '사용법: ./tpa start|stop|restart|status|logs [줄수]|follow|versions'
-    echo '기존 npm 명령: ./tpa npm run bot:status (이 프로젝트의 전용 Node 사용)'
     ;;
   *)
     echo '지원하지 않는 명령입니다. ./tpa help로 확인하세요.' >&2

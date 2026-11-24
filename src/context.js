@@ -6,6 +6,7 @@ export function quickCommand(text){
  const lookup=s.match(/^(오늘|이번주|전체|전부|모든|남은)(?:의)?(?:남은)?(?:일정|목록|할일|과업)(?:은|는|을|를|이|가)?(?:전부|전체|모두)?(?:알려줘|알려주세요|보여줘|보여주세요|띄워줘|조회해줘|뭐지|뭐야|뭐있어|뭐가있어|뭐있지|뭐가있지)?$/u);
  if(lookup)return {오늘:'/today',이번주:'/week',전체:'/list',전부:'/list',모든:'/list',남은:'/list'}[lookup[1]];
  if(s==='오늘뭐해야해')return '/today';
+ if(/^(?:구글캘린더|googlecalendar)동기화상태(?:알려줘|보여줘|알려주세요|보여주세요)?$/iu.test(s))return '/calendarsync';
  if(['명령어알려줘','사용법알려줘','도움말'].includes(s))return '/help';
  return null;
 }
@@ -97,6 +98,13 @@ export function nextConversation(actor,text,reply,taskIds,previous,now=new Date(
 export function messageReferences(parts,refs){return parts.map(part=>[...new Set(refs.filter(t=>part.includes(t.title.replace(/[\r\n]+/g,' ').trim())).map(t=>t.id))]);}
 export function summarizeHistory(events){return events.map(e=>({actor:e.actor,task_id:e.task_id,at:e.at,reason:(e.reason||'').slice(0,250),reasonTruncated:(e.reason||'').length>250,before:summary(e.before),after:summary(e.after)}));}
 function summary(t){if(!t)return null;return Object.fromEntries(['id','title','kind','status','dueDate','time','endDate','endTime','timeType','timeNote','sourceTimeZone','person','assignee','actualDeadline'].filter(k=>k in t).map(k=>[k,t[k]]));}
+
+export function allCandidateDecision(text) {
+ const answer=text.trim().replace(/[.!?\s]+$/u,'').replace(/요$/u,'');
+ if (/^(?:응|네|예|맞아|좋아|승인|둘\s*다|두\s*개|모두|전부)(?:\s*(?:해\s*줘|처리해\s*줘))?$/u.test(answer)) return 'approve';
+ if (/^(?:아니|아니오|거절|안\s*할래)$/u.test(answer)) return 'reject';
+ return null;
+}
 
 export function validateClarification(value,allowedIds){
  if(!value)return null;

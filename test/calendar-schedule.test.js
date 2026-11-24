@@ -8,6 +8,10 @@ import { processJob, schedule } from '../src/processor.js';
 import { expandSeries, occurrenceDay, occurrenceId, validateSeries } from '../src/recurrence.js';
 import { buildPrompt } from '../src/assistant/codex.js';
 import { dateTimePolicy } from '../src/assistant/date-time-policy.js';
+import { recordLink } from '../src/calendar-sync/store.js';
+import { localEvent } from '../src/calendar-sync/mapping.js';
+import { syncCalendarOnce } from '../src/calendar-sync/worker.js';
+import { createScheduleSeries } from '../src/schedule-store.js';
 
 const family = '129eec5c-61c8-418a-b670-7db608bb08a1';
 const otherFamily = '129eec5c-61c8-418a-b670-7db608bb08a2';
@@ -181,6 +185,114 @@ test('first materialization, movement, completion, cancellation and Telegram und
   assert.deepEqual(snapshot.calendar.calendar_sync_outbox,[]);
 });
 
+test('Telegram undo reconciles pending, completed and uncertain Google cancellations without duplicates', async t => {
+  const {query,store}=await isolated(t);
+  const settings={familyId:family,calendarId:'undo.calendar',key:Buffer.alloc(32),allowDelete:true};
+  const connection={family_id:family,id:otherFamily,key:settings.key};
+  const env={CALENDAR_SYNC_ENABLED:'true',CALENDAR_SYNC_FAMILY_ID:family,GOOGLE_CALENDAR_ID:settings.calendarId,CALENDAR_SYNC_ALLOW_DELETE:'true'};
+  const previous=Object.fromEntries(Object.keys(env).map(key=>[key,process.env[key]]));
+  Object.assign(process.env,env);
+  t.after(()=>{for(const [key,value] of Object.entries(previous)) {
+    if (value===undefined) delete process.env[key]; else process.env[key]=value;
+  }});
+  await query(`insert into assistant.calendar_sync_state(family_id,id,calendar_id,mode,sync_token)
+    values($1,$2,$3,'bidirectional','initial')`,[family,connection.id,settings.calendarId]);
+  const remote=new Map(), incoming=[];
+  let creates=0, uncertain=false, lostCreateResponse=false;
+  const error=status=>Object.assign(new Error('Simulated Google failure'),{status});
+  const api={
+    list:async()=>({items:incoming.splice(0),nextSyncToken:'current'}),
+    get:async id=>{if (!remote.has(id)) throw error(404); return remote.get(id);},
+    create:async event=>{
+      assert.ok(!remote.has(event.id));
+      const created={...event,etag:'created'};
+      remote.set(event.id,created);
+      incoming.push(created);
+      creates++;
+      if (lostCreateResponse) { lostCreateResponse=false; throw error(503); }
+      return created;
+    },
+    remove:async id=>{
+      remote.delete(id);
+      incoming.push({id,status:'cancelled',etag:'deleted'});
+      if (uncertain) throw error(503);
+    },
+    instances:async parentId=>({items:[...remote.values()].filter(event=>event.recurringEventId===parentId)}),
+    patch:async (id,fields,etag)=>{
+      assert.equal(remote.get(id).etag,etag);
+      const updated={...remote.get(id),...fields,etag:etag+'-updated'};
+      remote.set(id,updated);
+      incoming.push(updated);
+      return updated;
+    }
+  };
+  const tick=async()=>{
+    assert.equal(await syncCalendarOnce(store.pool,settings,api,new AbortController().signal,{force:true}),true);
+  };
+  async function cancelAndGetUndo(title,id,date) {
+    await request(store,(date ? date+' ' : '')+title+' 취소해줘',{
+      classify:async()=>({intent:'cancel',targets:[title],answer:null}),
+      answer:async({tasks})=>{
+        const task=tasks.find(item=>item.id===id);
+        assert.ok(task);
+        return {actions:[{operation:'update',id,expectedVersion:task.version,task:{...task,status:'cancelled'}}]};
+      }
+    });
+    const {rows}=await query(`select substring(key from 8) as token from assistant.runtime
+      where key like 'button:%' and value->>'kind'='undo' and value->'changes'->0->'after'->>'id'=$1`,[id]);
+    assert.equal(rows.length,1);
+    await query("update assistant.runtime set value=jsonb_set(value,'{expiresAt}',to_jsonb('2099-01-01T00:00:00Z'::text)) where key=$1",
+      ['button:'+rows[0].token]);
+    return rows[0].token;
+  }
+  for (const stage of ['pending','done','uncertain']) {
+    const task=planTaskCreation({...legacyInput,title:'Undo '+stage},'test',now).after;
+    await query('insert into assistant.tasks(family_id,id,version,data) values($1,$2,$3,$4)',[family,task.id,task.version,task]);
+    const event={id:stage,etag:'active',...localEvent('task',task,timeZone)};
+    remote.set(event.id,event);
+    await store.tx(c=>recordLink(c,connection,'task',task,event,{source:'import'}));
+    const token=await cancelAndGetUndo(task.title,task.id);
+    uncertain=stage==='uncertain';
+    if (stage!=='pending') await tick();
+    assert.equal(remote.has(event.id),stage==='pending');
+    assert.match(await request(store,'',null,{button:{token,index:0,messageId:1}}),/되돌렸어요/);
+    if (stage==='done') lostCreateResponse=true;
+    await tick();
+    if (stage==='done') {
+      await query("update assistant.calendar_sync_outbox set next_attempt_at=now() where state='uncertain'");
+      await tick();
+    }
+    const [restored]=[...remote.values()].filter(item=>item.summary===task.title);
+    assert.ok(restored);
+    assert.equal([...remote.values()].filter(item=>item.summary===task.title).length,1);
+    assert.equal(restored.id===event.id,stage==='pending');
+    const links=(await query('select * from assistant.calendar_event_links where task_id=$1',[task.id])).rows;
+    assert.equal(links.find(link=>link.status==='active').google_event_id,restored.id);
+    assert.equal(links.find(link=>link.status==='active').agreed_fields.source,'import');
+    assert.equal((await store.tasks()).find(item=>item.id===task.id).status,'open');
+    assert.equal((await store.tasks()).filter(item=>item.title===task.title).length,1);
+  }
+  assert.equal(creates,2);
+  const series=await store.tx(c=>createScheduleSeries(c,family,daySeries,'1',{origin:'google'}));
+  const parent={id:'series',etag:'parent',...localEvent('series',series,timeZone)};
+  remote.set(parent.id,parent);
+  await store.tx(c=>recordLink(c,connection,'series',series,parent));
+  const [task,sibling]= (await store.calendarTasks({now,timeZone})).filter(item=>item.recurrence?.seriesId===series.id);
+  const instance={id:'instance',etag:'child',recurringEventId:parent.id,originalStartTime:{date:task.dueDate},
+    ...localEvent('occurrence',task,timeZone)};
+  remote.set(instance.id,instance);
+  const token=await cancelAndGetUndo(task.title,task.id,task.dueDate);
+  await tick();
+  assert.equal(remote.get(instance.id).status,'cancelled');
+  assert.match(await request(store,'',null,{button:{token,index:0,messageId:1}}),/되돌렸어요/);
+  await tick();
+  await tick();
+  assert.equal(remote.get(instance.id).status,'confirmed');
+  assert.equal((await store.calendarTasks({now,timeZone})).find(item=>item.id===sibling.id).status,'open');
+  assert.equal(creates,2);
+  assert.deepEqual((await query('select reason from assistant.calendar_sync_conflicts')).rows,[]);
+});
+
 test('approved link retains existing UUID, state, custom fields and history and forbids cross-family links', async t => {
   const {query,store,other} = await isolated(t);
   const legacy = {...planTaskCreation(legacyInput,'fixture',now).after, extra:{kept:true}};
@@ -311,7 +423,8 @@ test('ordinary timing types distinguish all-day, unknown, deadline, condition an
   const reply = await request(store,'생일, 시간 미정 병원, 서류 마감, 기사 방문 조건과 회의 범위를 등록해줘',ordinary);
   assert.match(reply,/종일/);
   assert.match(reply,/시간 미정/);
-  assert.match(reply,/오후 2시 ~ 오후 3시 30분/);
+  assert.match(reply,/팀 회의[^\n]*\n[^\n]*오후 2시/);
+  assert.doesNotMatch(reply,/오후 3시 30분/);
   const tasks = await store.tasks();
   for (const draft of drafts) {
     const task = tasks.find(row => row.title === draft.title);
@@ -333,7 +446,7 @@ test('repeat timing types survive projections and a single unknown occurrence ca
     ['매주 수요일 진료, 시간은 미정으로 반복해줘',{title:'진료',frequency:'WEEKLY',weekday:3,timeType:'unknown'},/시간 미정/],
     ['매주 수요일 14시 이후 기사 방문 잡아줘',{title:'기사 방문',frequency:'WEEKLY',weekday:3,timeType:'condition',timeNote:'14시 이후'},/14시 이후/],
     ['매주 수요일 도쿄 시간 14시부터 15시 30분까지 회의 잡아줘',
-      {title:'회의',frequency:'WEEKLY',weekday:3,timeType:'range',time:'14:00',endTime:'15:30',timeZone:'Asia/Tokyo'},/14:00 ~ 15:30/],
+      {title:'회의',frequency:'WEEKLY',weekday:3,timeType:'range',time:'14:00',endTime:'15:30',timeZone:'Asia/Tokyo'},/\) 14:00\n/],
     ['수요일마다 서류 제출 마감 잡아줘',{title:'서류 제출',frequency:'WEEKLY',weekday:3,timeType:'date_only'},/마감/]
   ];
   for (const [text,fields,expected] of cases) {
@@ -367,6 +480,49 @@ test('repeat timing types survive projections and a single unknown occurrence ca
   assert.equal(updated.find(task=>task.id===sibling.id).timeType,'all_day');
   assert.deepEqual((await store.backup()).calendar.calendar_sync_outbox,[]);
 });
+test('explicit completion and change find a virtual recurrence beyond the default window', async t => {
+  const {store}=await isolated(t);
+  const title='연동테스트3';
+  const series=await store.createScheduleSeries({
+    title,kind:'appointment',timezone:timeZone,all_day:false,time_type:'timed',
+    start_at:'2026-11-24T09:00:00Z',recurrence_raw:['RRULE:FREQ=WEEKLY;BYDAY=TU;COUNT=7']
+  },'1');
+  const on=day=>store.calendarTasks({now,timeZone,from:day,to:day,listOnly:true});
+  const [original]=await on('2026-12-29');
+  assert.ok(original.recurrence.virtual);
+  assert.ok(!(await store.calendarTasks({now,timeZone})).some(task=>task.id===original.id));
+
+  const answer=(intent,patch,id)=>({
+    classify:async()=>({intent,targets:[title],answer:null}),
+    answer:async input=>{
+      assert.deepEqual(input.tasks.map(task=>task.id),[id]);
+      assert.equal(input.selectedTaskId,id);
+      const [task]=input.tasks;
+      return {actions:[{operation:'update',id,expectedVersion:task.version,task:{...task,...patch}}]};
+    }
+  });
+  const [january]=await on('2027-01-05');
+  assert.match(await request(store,'2027년 1월 5일 연동테스트3 완료해줘',
+    answer('complete',{status:'done'},january.id)),/저장 완료/);
+  assert.equal((await on('2027-01-05'))[0].status,'done');
+  assert.match(await request(store,'12월 29일 연동테스트3을 12월 30일 오후 7시로 옮겨줘',
+    answer('update',{dueDate:'2026-12-30',time:'19:00'},original.id)),/저장 완료/);
+  assert.deepEqual(await on('2026-12-29'),[]);
+  const [moved]=await on('2026-12-30');
+  assert.equal(moved.id,original.id);
+  assert.equal(moved.recurrence.seriesId,series.id);
+  assert.equal(moved.time,'19:00');
+  assert.match(await request(store,'12월 30일 연동테스트3 완료해줘',
+    answer('complete',{status:'done'},original.id)),/저장 완료/);
+  assert.equal((await on('2026-12-30'))[0].status,'done');
+
+  assert.match(await request(store,'연동테스트3을 12월 30일 오후 7시로 옮겨줘',{
+    classify:async()=>({intent:'update',targets:[title],answer:null}),
+    answer:async()=>assert.fail('multiple default candidates must be narrowed before an update')
+  }),/후보가 \d+건/);
+  assert.equal((await on('2026-12-22'))[0].status,'open');
+});
+
 test('all-list window covers finite, open-ended, virtual and materialized occurrences without altering records', async t => {
   const {store,query} = await isolated(t);
   const seriesOn = (title,date,recurrence_raw = ['RRULE:FREQ=DAILY;COUNT=1']) => store.createScheduleSeries({

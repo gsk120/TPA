@@ -4,9 +4,11 @@ const nullable = { type: ['string', 'null'] };
 const timeType = {type:['string','null'],enum:[...timeTypes,null]};
 const seriesProperties = {
   title: nullable,
-  frequency: {type:['string','null'],enum:['DAILY','WEEKLY','MONTHLY',null]},
+  frequency: {type:['string','null'],enum:['DAILY','WEEKLY','MONTHLY','YEARLY',null]},
   weekday: {type:['integer','null']},
   monthDay: {type:['integer','null']},
+  yearMonth: {type:['integer','null']},
+  calendarSystem: {type:['string','null'],enum:['solar','lunar',null]},
   start: nullable,
   end: nullable,
   time: nullable,

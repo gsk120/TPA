@@ -13,6 +13,8 @@ import {recordSkillFailure} from './core/complete.js';
 import {deliverSkillContent} from './core/delivery.js';
 import {createCalendarSkill,inspectCalendarEntry} from './skills/calendar.js';
 import {debugEvent,errorFields,jobDebug,jobTrace,withJobTrace} from './diagnostics.js';
+import {calendarSettings} from './calendar-sync/google.js';
+import {runCalendarSync} from './calendar-sync/worker.js';
 let stopping=false;const shutdown=new AbortController();
 let runtime;
 function stop(){stopping=true;shutdown.abort();}
@@ -151,7 +153,7 @@ async function main(stage){
    }
    await pause(3100);
   }}catch{console.error('발송·DB 확인 실패.');await pause(10000);}if(!sent)await pause(1500);}};
-  await Promise.all([poll(),worker(),worker(),scheduler(),deliver()]);
+  await Promise.all([poll(),worker(),worker(),scheduler(),deliver(),runCalendarSync(pool,calendarSettings(),shutdown.signal)]);
  }finally{await families.close();}
 }
 async function boot(){

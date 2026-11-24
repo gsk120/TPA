@@ -2,6 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { calendarDay, expandSeries, isDateAnchored, occurrenceDay, occurrenceId, occurrenceWindow, validateSeries, wallInstants, wallTime, withinOccurrenceWindow } from './recurrence.js';
 import { validDay } from './time.js';
+import { queueCalendarChange } from './calendar-sync/outbox.js';
+import { isActive } from './tasks.js';
 
 const seriesFields = 'id,version,title,kind,status,timezone,all_day,start_date::text,end_date_exclusive::text,start_at,end_at,recurrence_raw,edit_mode,created_at,time_type,time_note';
 const selectSeries = 'select ' + seriesFields + ' from assistant.schedule_series where family_id=$1';
@@ -91,7 +93,8 @@ function taskProjection(familyId, series, original, row, task, timeZone) {
   return {...base, ...dates, title, ...(timeType ? {timeType} : {}), recurrence:{
     seriesId:series.id, seriesVersion:series.version, anchor:original.anchor,
     occurrenceId:row?.occurrence_id ?? id, virtual:!task,
-    allDay:timeType ? timeType === 'all_day' : series.all_day, timing, timeZone
+    allDay:timeType ? timeType === 'all_day' : series.all_day, timing, timeZone, seriesTimeZone:series.timezone,
+    rule:series.recurrence_raw, dateAnchored:isDateAnchored(series)
   }};
 }
 
@@ -119,6 +122,24 @@ export async function readCalendarTasks(c, familyId, tasks, {now, timeZone, from
     const projection = taskProjection(familyId, series, original, row, task, timeZone);
     return !listOnly || withinOccurrenceWindow(projection,window) ? [projection] : [];
   });
+  if (seriesList.some(series=>series.edit_mode==='read_only' && series.status==='active')) {
+    const snapshots=(await c.query(`select distinct on (series_id) series_id,remote_timing->'googleInstances' as snapshot
+      from assistant.calendar_event_links where family_id=$1 and anchor_key is null
+      and (status='active' or status='replaced' and agreed_fields->'detachment'->>'state'='unlinked')
+      and remote_timing ? 'googleInstances' order by series_id,(status='active') desc,deleted_at desc nulls last`,[familyId])).rows;
+    for (const {series_id,snapshot} of snapshots) {
+      const series=seriesById.get(series_id);
+      if (series?.edit_mode!=='read_only' || series.status!=='active') continue;
+      for (const instance of snapshot.occurrences) {
+        const timeType=instance.allDay?'all_day':'range';
+        const task=taskProjection(familyId,{...series,title:snapshot.hideTitle?'Google 일정':series.title,
+          time_type:timeType},instance,null,null,timeZone);
+        task.recurrence.readOnly=true;
+        task.recurrence.dateAnchored=isDateAnchored(series);
+        if (exactIds.has(task.id) || withinOccurrenceWindow(task,window)) projections.push(task);
+      }
+    }
+  }
   for (const series of seriesList) {
     if (series.status !== 'active' || series.edit_mode !== 'supported') continue;
     const length = isDateAnchored(series)
@@ -146,31 +167,34 @@ export async function readCalendarTasks(c, familyId, tasks, {now, timeZone, from
   return projections;
 }
 
-function writeSeriesHistory(c, familyId, seriesId, anchor, actor, before, after, reason) {
+function writeSeriesHistory(c, familyId, seriesId, anchor, actor, before, after, reason, origin='local') {
   return c.query(
-    "insert into assistant.schedule_series_history(family_id,series_id,anchor_key,actor,origin,before_data,after_data,reason) values($1,$2,$3,$4,'local',$5,$6,$7)",
-    [familyId,seriesId,anchor,String(actor),before,after,reason]
+    'insert into assistant.schedule_series_history(family_id,series_id,anchor_key,actor,origin,before_data,after_data,reason) values($1,$2,$3,$4,$5,$6,$7,$8)',
+    [familyId,seriesId,anchor,String(actor),origin,before,after,reason]
   );
 }
 
-export async function createScheduleSeries(c, familyId, input, actor) {
-  validateSeries(input);
+export async function createScheduleSeries(c, familyId, input, actor, {origin='local',readOnly=false}={}) {
+  if (readOnly && origin!=='google') throw changed();
+  if (!readOnly) validateSeries(input);
   const id = randomUUID();
   const dateAnchored = isDateAnchored(input);
   const row = (await c.query(
-    'insert into assistant.schedule_series(family_id,id,title,kind,timezone,all_day,start_date,end_date_exclusive,start_at,end_at,recurrence_raw,time_type,time_note) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) returning ' + seriesFields,
+    'insert into assistant.schedule_series(family_id,id,title,kind,timezone,all_day,start_date,end_date_exclusive,start_at,end_at,recurrence_raw,time_type,time_note,edit_mode) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) returning ' + seriesFields,
     [familyId,id,input.title.trim(),input.kind,input.timezone,input.all_day,
       dateAnchored ? input.start_date : null,dateAnchored ? input.end_date_exclusive : null,
       dateAnchored ? null : input.start_at,dateAnchored ? null : input.end_at,input.recurrence_raw,
-      input.time_type ?? null,input.time_note ?? null]
+      input.time_type ?? null,input.time_note ?? null,readOnly?'read_only':'supported']
   )).rows[0];
-  await writeSeriesHistory(c,familyId,id,null,actor,null,normalizeSeries(row),'반복 일정 등록');
-  return normalizeSeries(row);
+  const series = normalizeSeries(row);
+  await writeSeriesHistory(c,familyId,id,null,actor,null,series,'반복 일정 등록',origin);
+  await queueCalendarChange(c,familyId,'series',null,series,{origin});
+  return series;
 }
 
-export async function updateScheduleSeries(c, familyId, id, expectedVersion, patch, actor) {
+export async function updateScheduleSeries(c, familyId, id, expectedVersion, patch, actor, {origin='local',requireActive=false}={}) {
   const row = (await c.query(selectSeries + ' and id=$2 for update',[familyId,id])).rows[0];
-  if (!row || row.version !== expectedVersion || row.edit_mode !== 'supported') throw changed();
+  if (!row || row.version !== expectedVersion || row.edit_mode !== 'supported' || requireActive && row.status !== 'active') throw changed();
   const allowed = ['title','status','timezone','all_day','start_date','end_date_exclusive','start_at','end_at','recurrence_raw','time_type','time_note'];
   if (Object.keys(patch).some(key => !allowed.includes(key))) throw new Error('반복 일정 변경 필드를 확인하세요.');
   const old = normalizeSeries(row);
@@ -219,8 +243,20 @@ export async function updateScheduleSeries(c, familyId, id, expectedVersion, pat
     await c.query('insert into assistant.history(family_id,actor,task_id,before_data,after_data,reason) values($1,$2,$3,$4,$5,$6)',
       [familyId,String(actor),task.id,task,after,reason]);
   }
-  await writeSeriesHistory(c,familyId,id,null,actor,old,series,reason);
+  await writeSeriesHistory(c,familyId,id,null,actor,old,series,reason,origin);
+  await queueCalendarChange(c,familyId,'series',old,series,{origin});
   return series;
+}
+
+export async function cancelImportedScheduleSeries(c,familyId,series,actor) {
+  if (series.edit_mode==='supported') {
+    return updateScheduleSeries(c,familyId,series.id,series.version,{status:'cancelled'},actor,{origin:'calendar-management'});
+  }
+  const {rows}=await c.query(`update assistant.schedule_series set status='cancelled',version=version+1,updated_at=now()
+    where family_id=$1 and id=$2 and version=$3 and edit_mode='read_only' returning `+seriesFields,
+  [familyId,series.id,series.version]);
+  if (!rows.length) throw changed();
+  await writeSeriesHistory(c,familyId,series.id,null,actor,series,rows[0],'Google Calendar import undone','calendar-management');
 }
 
 function sameDates(before, after) {
@@ -265,6 +301,7 @@ async function lockOccurrence(c, familyId, seriesId, anchor) {
   const row = (await c.query(selectSeries + ' and id=$2 for update', [familyId,seriesId])).rows[0];
   if (!row) throw changed();
   const series = normalizeSeries(row);
+  if (series.edit_mode==='read_only') throw new Error('Google에서 가져온 읽기 전용 반복 일정입니다. Google Calendar에서 변경해주세요.');
   if (series.status !== 'active' || series.edit_mode !== 'supported') throw changed();
   const original = originalOccurrence(series,anchor);
   if (!original) throw changed();
@@ -282,7 +319,7 @@ async function saveOccurrence(c, familyId, series, original, taskId) {
   );
 }
 
-async function saveException(c, familyId, seriesId, anchor, actor, saved, status, overrides, reason) {
+async function saveException(c, familyId, seriesId, anchor, actor, saved, status, overrides, reason, origin='local') {
   const before = saved?.exception_status ? {status:saved.exception_status,overrides:saved.overrides} : null;
   const after = {status,overrides};
   if (isDeepStrictEqual(before,after) || !before && status === 'modified' && !Object.keys(overrides).length) return;
@@ -290,13 +327,28 @@ async function saveException(c, familyId, seriesId, anchor, actor, saved, status
     'insert into assistant.schedule_exceptions(family_id,series_id,anchor_key,version,status,overrides) values($1,$2,$3,1,$4,$5) on conflict(family_id,series_id,anchor_key) do update set version=assistant.schedule_exceptions.version+1,status=excluded.status,overrides=excluded.overrides,updated_at=now()',
     [familyId,seriesId,anchor,status,overrides]
   );
-  await writeSeriesHistory(c,familyId,seriesId,anchor,actor,before,after,reason);
+  await writeSeriesHistory(c,familyId,seriesId,anchor,actor,before,after,reason,origin);
 }
 
-export async function applyOccurrenceChange(c, familyId, actor, change) {
+export async function calendarOccurrence(c,familyId,seriesId,start,zone) {
+  const row = (await c.query(selectSeries+' and id=$2 for update',[familyId,seriesId])).rows[0];
+  if (!row || row.status !== 'active' || row.edit_mode !== 'supported') return null;
+  const series = normalizeSeries(row);
+  const day = validDay(start) ? start : wallTime(Date.parse(start),series.timezone).slice(0,10);
+  const original = [...expandSeries(series,day,day)].find(item=>item.start===start);
+  if (!original) return null;
+  const saved = (await c.query(selectOccurrences+' and o.series_id=$2 and o.anchor_key=$3',
+    [familyId,seriesId,original.anchor])).rows[0];
+  const task = saved?.task_id ? (await c.query('select data from assistant.tasks where family_id=$1 and id=$2 for update',
+    [familyId,saved.task_id])).rows[0]?.data : null;
+  return taskProjection(familyId,series,original,saved,task,zone);
+}
+
+export async function applyOccurrenceChange(c, familyId, actor, change, {origin='local'}={}) {
   const {before,after,reason} = change;
   const token = before.recurrence;
   const {series,original,saved} = await lockOccurrence(c,familyId,token.seriesId,token.anchor);
+  if (change.requireActive && (!isActive(before) || saved?.exception_status === 'cancelled')) throw changed();
   const taskId = saved?.task_id ?? occurrenceId(familyId,series.id,original.anchor);
   if (taskId !== before.id || after.id !== taskId || series.version !== token.seriesVersion
     || token.virtual === Boolean(saved?.task_id) || after.version !== before.version + 1) throw changed();
@@ -317,8 +369,9 @@ export async function applyOccurrenceChange(c, familyId, actor, change) {
   if (overrides.title === series.title) delete overrides.title;
   if (saved?.task_id) {
     const updated = await c.query(
-      'update assistant.tasks set version=$4,data=$5 where family_id=$1 and id=$2 and version=$3',
-      [familyId,taskId,oldTask.version,newTask.version,newTask]
+      `update assistant.tasks set version=$4,data=$5 where family_id=$1 and id=$2 and version=$3
+        ${change.requireActive ? "and data->>'status'=$6" : ''}`,
+      [familyId,taskId,oldTask.version,newTask.version,newTask,...(change.requireActive ? [oldTask.status] : [])]
     );
     if (!updated.rowCount) throw changed();
     await c.query("update assistant.deliveries set status='cancelled' where family_id=$1 and task_id=$2 and status='pending'",[familyId,taskId]);
@@ -326,9 +379,11 @@ export async function applyOccurrenceChange(c, familyId, actor, change) {
     await c.query('insert into assistant.tasks(family_id,id,version,data) values($1,$2,$3,$4)',[familyId,taskId,newTask.version,newTask]);
   }
   await saveOccurrence(c,familyId,series,original,taskId);
-  await saveException(c,familyId,series.id,original.anchor,actor,saved,newTask.status === 'cancelled' ? 'cancelled' : 'modified',overrides,reason);
+  await saveException(c,familyId,series.id,original.anchor,actor,saved,newTask.status === 'cancelled' ? 'cancelled' : 'modified',overrides,reason,origin);
   await c.query('insert into assistant.history(family_id,actor,task_id,before_data,after_data,reason) values($1,$2,$3,$4,$5,$6)',
     [familyId,String(actor),taskId,oldTask,newTask,reason]);
+  const updated = {...newTask,recurrence:{...token,timing:overrides.timing ?? original,original:original.start}};
+  await queueCalendarChange(c,familyId,'occurrence',before,updated,{origin,restoreCancellation:change.restoreCancellation});
 }
 
 // Called by an approved local administrative action after matching the original slot.

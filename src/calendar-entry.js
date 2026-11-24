@@ -1,4 +1,4 @@
-import { calendarStateKey, conversationLifetimeMs, isPendingInChat, liveCalendarState, quickCommand, selectedDetail } from './context.js';
+import { allCandidateDecision, calendarStateKey, conversationLifetimeMs, isPendingInChat, liveCalendarState, quickCommand, selectedDetail } from './context.js';
 import { directCompletionTarget, requestedCompletionTitle } from './natural.js';
 import { isActive } from './tasks.js';
 import { defaults } from './settings.js';
@@ -25,7 +25,7 @@ const dateAnswer = new RegExp(`^${day}(?:\\s*(?:하루|날|거|것|건|일정))?
 const timeAnswer = new RegExp(`^(?:${clock}(?:\\s*(?:부터|에서|~|–|-)\\s*${clock}(?:\\s*까지)?)?(?:\\s*(?:이후|이전))?|종일|하루\\s*종일|시간\\s*미정|미정)(?:으?로)?$`, 'u');
 const dateAndTime = new RegExp(`^${day}\\s+${clock}(?:으?로)?$`, 'u');
 const seriesScope = /^(?:(?:\d{1,2}\s*월(?:\s*\d{1,2}\s*일)?\s*(?:에\s*)?(?:이후\s*|이전\s*|부터\s*|시작(?:한|하는)\s*)?)?(?:(?:반복\s*)?(?:시리즈\s*)?전체(?:\s*시리즈|\s*반복)?|시리즈|(?:한\s*|해당\s*|그\s*)?회차)(?:\s*만)?|전체\s*취소)$/u;
-const seriesFrequency = /^(?:매일|매주(?:\s*[월화수목금토일]요일)?|매월(?:\s*(?:말일|\d{1,2}\s*일))?|[월화수목금토일]요일마다)(?:\s*반복)?$/u;
+const seriesFrequency = /^(?:매일|매주(?:\s*[월화수목금토일]요일)?|매월(?:\s*(?:말일|\d{1,2}\s*일))?|매년(?:\s*(?:양력|음력))?(?:\s*\d{1,2}\s*월\s*\d{1,2}\s*일)?|양력|음력|[월화수목금토일]요일마다)(?:\s*반복)?$/u;
 const acknowledgement = /^(?:응|네|예|맞아|승인|좋아|모두|전부|아니|아니요|아니오|거절|취소|안\s*할래)(?:요)?[.!\s]*$/u;
 const selection = /^(?:\d+\s*(?:번|번째)?|(?:첫|두|세|네)\s*번째|마지막|둘\s*다|두\s*개|모두|전부)(?:이야|이요|야|요)?[.!\s]*$/u;
 const combinedSelection = /^(?:응|네|예|맞아|승인|좋아|아니요?|\d+\s*(?:번|번째)|(?:첫|두|세)\s*번째|둘\s*다)(?:요)?(?:\s*[,，.!]\s*|\s+(?:그리고|또)\s+).+$/u;
@@ -81,7 +81,7 @@ export async function planCalendarPending({ job, store, now, options }, entry, {
         choices = order.map((id, index) => {
           const task = byId.get(id);
           const version = state.workflow?.versions?.[id];
-          if (!task || version != null && task.version !== version) return `${index + 1}. 지금 확인할 수 없는 후보`;
+          if (!task || state.request?.activeTargets && !isActive(task) || version != null && task.version !== version) return `${index + 1}. 지금 확인할 수 없는 후보`;
           refs.push({ id, title:task.title });
           return `${index + 1}. ${task.title.replace(/[\r\n]+/g, ' ')} · ${task.dueDate ?? '날짜 미정'}${task.time ? ' ' + task.time : ''}`;
         }).join('\n');
@@ -122,6 +122,7 @@ function pendingAnswer(text, state, tasks) {
   if (request.dateCompletion) return acknowledgement.test(text)
     || (!request.dateCompletion.targets && dateAnswer.test(answer));
   if (request.seriesCancellation) return seriesScope.test(answer) || dateAnswer.test(answer);
+  if (request.confirmAllCandidates) return !!allCandidateDecision(text);
   if (candidateAnswer(text, state, tasks)) return true;
   if (request.chooseByDate) return dateAnswer.test(answer) || timeAnswer.test(answer);
   const expected = `${request.unresolved ?? ''} ${request.question ?? ''}`;
